@@ -97,6 +97,32 @@ where
     deserializer.deserialize_any(PatchSizeVisitor)
 }
 
+/// Custom deserializer for image size fields used by HuggingFace processors.
+///
+/// Most checkpoints use a mapping such as `{"height": 672, "width": 672}`,
+/// while MiniMax-M3 serializes the same value as `[672, 672]`.  Keep the
+/// public map representation and normalize the two-element sequence to
+/// height/width during deserialization.
+fn deserialize_size<'de, D>(deserializer: D) -> Result<Option<HashMap<String, u32>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum SizeValue {
+        Map(HashMap<String, u32>),
+        HeightWidth([u32; 2]),
+    }
+
+    let value = Option::<SizeValue>::deserialize(deserializer)?;
+    Ok(value.map(|value| match value {
+        SizeValue::Map(size) => size,
+        SizeValue::HeightWidth([height, width]) => {
+            HashMap::from([("height".to_string(), height), ("width".to_string(), width)])
+        }
+    }))
+}
+
 /// HuggingFace preprocessor_config.json structure.
 ///
 /// This struct captures the common fields across different vision model processors.
@@ -148,8 +174,8 @@ pub struct PreProcessorConfig {
     pub resampling: Option<usize>,
 
     /// Target size for resizing
-    /// Can be {"height": H, "width": W} or {"shortest_edge": S}
-    #[serde(default)]
+    /// Can be {"height": H, "width": W}, {"shortest_edge": S}, or [H, W].
+    #[serde(default, deserialize_with = "deserialize_size")]
     pub size: Option<HashMap<String, u32>>,
 
     /// Target size for center cropping
@@ -512,6 +538,11 @@ mod tests {
         let json2 = r#"{"size": {"shortest_edge": 224}}"#;
         let config2 = PreProcessorConfig::from_json(json2).unwrap();
         assert_eq!(config2.get_target_size(), Some((224, 224)));
+
+        // MiniMax-M3 uses a two-element [height, width] sequence.
+        let json3 = r#"{"size": [672, 448]}"#;
+        let config3 = PreProcessorConfig::from_json(json3).unwrap();
+        assert_eq!(config3.get_target_size(), Some((672, 448)));
     }
 
     #[test]

@@ -12,6 +12,7 @@
 //! - **Qwen3-VL** (`qwen3_vl`): Similar to Qwen2-VL but with patch_size=16 and [0.5,0.5,0.5] normalization
 //! - **Qwen3-Omni** (`qwen3_omni_vision`): Qwen3 vision preprocessing with Omni video limits and timing metadata
 //! - **Kimi-K2.5** (`kimi_k25`): MoonViT resize and zero-padding to patch alignment
+//! - **MiniMax-M3 VL** (`minimax_m3_vl`): Dynamic resolution with merge-grouped patches
 //! - **Phi3-Vision** (`phi3_vision`): Dynamic HD transform with 336x336 tiles
 //! - **Phi4-Vision** (`phi4_vision`): Dynamic HD transform with 448x448 tiles and SiGLIP encoder
 //! - **LLaMA 4 Vision** (`llama4_vision`): Tile-based processing with 336x336 tiles and global tile
@@ -20,6 +21,7 @@
 pub mod kimi_k25;
 pub mod llama4_vision;
 pub mod llava;
+pub mod minimax_m3;
 pub mod phi3_vision;
 pub mod phi4_vision;
 pub mod pixtral;
@@ -31,6 +33,7 @@ pub mod qwen_vl_base;
 pub use kimi_k25::KimiK25Processor;
 pub use llama4_vision::Llama4VisionProcessor;
 pub use llava::{ImageAspectRatio, LlavaNextProcessor, LlavaProcessor};
+pub use minimax_m3::MiniMaxM3VLProcessor;
 pub use phi3_vision::Phi3VisionProcessor;
 pub use phi4_vision::Phi4VisionProcessor;
 pub use pixtral::PixtralProcessor;

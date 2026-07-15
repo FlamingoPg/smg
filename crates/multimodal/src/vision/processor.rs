@@ -203,9 +203,21 @@ impl VisionProcessorRegistry {
     /// - `qwen2.5-vl` -> Qwen2VLProcessor (same preprocessing as Qwen2-VL)
     /// - `qwen3-vl` -> Qwen3VLProcessor (patch_size=16, [0.5,0.5,0.5] normalization)
     /// - `qwen3.5` / `qwen3_5` -> Qwen3VLProcessor (Qwen3.5 reuses Qwen3-VL preprocessing)
+    /// - `minimax-m3` / `minimax_m3` -> MiniMaxM3VLProcessor
     /// - `phi-3-vision` -> Phi3VisionProcessor (HD transform with 336x336 tiles)
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
+
+        // MiniMax-M3 uses Qwen-style patchification with checkpoint-specific
+        // dynamic-resolution limits.
+        registry.register(
+            "minimax-m3",
+            Box::new(super::processors::MiniMaxM3VLProcessor::new()),
+        );
+        registry.register(
+            "minimax_m3",
+            Box::new(super::processors::MiniMaxM3VLProcessor::new()),
+        );
 
         // LLaVA-NeXT (v1.6+, anyres multi-crop)
         registry.register(
@@ -398,6 +410,21 @@ mod tests {
             .find("custom-model", Some("qwen3_vl"))
             .expect("qwen3 processor by model_type");
         assert_eq!(processor.model_name(), "qwen3-vl");
+    }
+
+    #[test]
+    fn test_registry_finds_minimax_m3_by_id_and_model_type() {
+        let registry = VisionProcessorRegistry::with_defaults();
+
+        let by_id = registry
+            .find("MiniMaxAI/MiniMax-M3-MXFP8", None)
+            .expect("minimax processor by model id");
+        assert_eq!(by_id.model_name(), "minimax-m3-vl");
+
+        let by_type = registry
+            .find("custom-model", Some("minimax_m3_vl"))
+            .expect("minimax processor by model type");
+        assert_eq!(by_type.model_name(), "minimax-m3-vl");
     }
 
     #[test]
