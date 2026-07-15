@@ -486,6 +486,17 @@ struct Router {
     encode_policy: Option<PolicyType>,
     multimodal_tensor_transport: Option<String>,
     multimodal_shm_min_bytes: Option<usize>,
+    multimodal_pixel_cache_mb: usize,
+    multimodal_log_timing: bool,
+    multimodal_image_max_input_bytes: usize,
+    multimodal_image_encoder_input_dtype: Option<String>,
+    multimodal_rdma_listen_ip: Option<String>,
+    multimodal_rdma_listen_port: u16,
+    multimodal_rdma_pool_slots: usize,
+    multimodal_rdma_slot_bytes: usize,
+    multimodal_rdma_worker_landing_wait_secs: u64,
+    multimodal_rdma_worker_read_timeout_secs: u64,
+    multimodal_rdma_slot_ttl_secs: Option<u64>,
 }
 
 impl Router {
@@ -806,6 +817,17 @@ impl Router {
             .dp_aware(self.dp_aware)
             .multimodal_tensor_transport(multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
+            .multimodal_pixel_cache_mb(self.multimodal_pixel_cache_mb)
+            .multimodal_log_timing(self.multimodal_log_timing)
+            .multimodal_image_max_input_bytes(self.multimodal_image_max_input_bytes)
+            .multimodal_image_encoder_input_dtype(self.multimodal_image_encoder_input_dtype.clone())
+            .multimodal_rdma_listen_ip(self.multimodal_rdma_listen_ip.clone())
+            .multimodal_rdma_listen_port(self.multimodal_rdma_listen_port)
+            .multimodal_rdma_pool_slots(self.multimodal_rdma_pool_slots)
+            .multimodal_rdma_slot_bytes(self.multimodal_rdma_slot_bytes)
+            .multimodal_rdma_worker_landing_wait_secs(self.multimodal_rdma_worker_landing_wait_secs)
+            .multimodal_rdma_worker_read_timeout_secs(self.multimodal_rdma_worker_read_timeout_secs)
+            .multimodal_rdma_slot_ttl_secs(self.multimodal_rdma_slot_ttl_secs)
             .routing_key_override(config::RoutingKeyOverrideConfig {
                 enabled: self.routing_key_override,
                 eviction_interval_secs: self.eviction_interval_secs,
@@ -953,6 +975,17 @@ impl Router {
         encode_policy = None,
         multimodal_tensor_transport = None,
         multimodal_shm_min_bytes = None,
+        multimodal_pixel_cache_mb = 0,
+        multimodal_log_timing = false,
+        multimodal_image_max_input_bytes = 268435456,
+        multimodal_image_encoder_input_dtype = None,
+        multimodal_rdma_listen_ip = None,
+        multimodal_rdma_listen_port = 18515,
+        multimodal_rdma_pool_slots = 64,
+        multimodal_rdma_slot_bytes = 33554432,
+        multimodal_rdma_worker_landing_wait_secs = 120,
+        multimodal_rdma_worker_read_timeout_secs = 60,
+        multimodal_rdma_slot_ttl_secs = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1079,6 +1112,17 @@ impl Router {
         encode_policy: Option<PolicyType>,
         multimodal_tensor_transport: Option<String>,
         multimodal_shm_min_bytes: Option<usize>,
+        multimodal_pixel_cache_mb: usize,
+        multimodal_log_timing: bool,
+        multimodal_image_max_input_bytes: usize,
+        multimodal_image_encoder_input_dtype: Option<String>,
+        multimodal_rdma_listen_ip: Option<String>,
+        multimodal_rdma_listen_port: u16,
+        multimodal_rdma_pool_slots: usize,
+        multimodal_rdma_slot_bytes: usize,
+        multimodal_rdma_worker_landing_wait_secs: u64,
+        multimodal_rdma_worker_read_timeout_secs: u64,
+        multimodal_rdma_slot_ttl_secs: Option<u64>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1219,6 +1263,17 @@ impl Router {
             encode_policy,
             multimodal_tensor_transport,
             multimodal_shm_min_bytes,
+            multimodal_pixel_cache_mb,
+            multimodal_log_timing,
+            multimodal_image_max_input_bytes,
+            multimodal_image_encoder_input_dtype,
+            multimodal_rdma_listen_ip,
+            multimodal_rdma_listen_port,
+            multimodal_rdma_pool_slots,
+            multimodal_rdma_slot_bytes,
+            multimodal_rdma_worker_landing_wait_secs,
+            multimodal_rdma_worker_read_timeout_secs,
+            multimodal_rdma_slot_ttl_secs,
         })
     }
 

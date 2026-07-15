@@ -74,6 +74,17 @@ class RouterArgs:
     dp_aware: bool = False
     multimodal_tensor_transport: str | None = None
     multimodal_shm_min_bytes: int | None = None
+    multimodal_pixel_cache_mb: int = 0
+    multimodal_log_timing: bool = False
+    multimodal_image_max_input_bytes: int = 256 * 1024 * 1024
+    multimodal_image_encoder_input_dtype: str | None = None
+    multimodal_rdma_listen_ip: str | None = None
+    multimodal_rdma_listen_port: int = 18_515
+    multimodal_rdma_pool_slots: int = 64
+    multimodal_rdma_slot_bytes: int = 32 * 1024 * 1024
+    multimodal_rdma_worker_landing_wait_secs: int = 120
+    multimodal_rdma_worker_read_timeout_secs: int = 60
+    multimodal_rdma_slot_ttl_secs: int | None = None
     routing_key_override: bool = False
     dp_minimum_tokens_scheduler: bool = False
     enable_igw: bool = False  # Enable IGW (Inter-Gateway) mode for multi-model support
@@ -580,6 +591,71 @@ class RouterArgs:
             type=int,
             default=RouterArgs.multimodal_shm_min_bytes,
             help="Minimum multimodal tensor size (bytes) before the SHM transport is used",
+        )
+        parser.add_argument(
+            f"--{prefix}multimodal-pixel-cache-mb",
+            type=int,
+            default=RouterArgs.multimodal_pixel_cache_mb,
+            help="Host-DRAM budget in MiB for cached preprocessed image tensors; 0 disables it",
+        )
+        parser.add_argument(
+            f"--{prefix}multimodal-log-timing",
+            action="store_true",
+            default=RouterArgs.multimodal_log_timing,
+            help="Log detailed multimodal preprocessing, assembly, and transport timing",
+        )
+        parser.add_argument(
+            f"--{prefix}multimodal-image-max-input-bytes",
+            type=int,
+            default=RouterArgs.multimodal_image_max_input_bytes,
+            help="Maximum accepted encoded image payload size before decode",
+        )
+        parser.add_argument(
+            f"--{prefix}multimodal-image-encoder-input-dtype",
+            choices=["float32", "bfloat16", "float16"],
+            default=RouterArgs.multimodal_image_encoder_input_dtype,
+            help="Router-wide TokenSpeed image encoder-input wire dtype",
+        )
+        parser.add_argument(
+            f"--{prefix}multimodal-rdma-listen-ip",
+            default=RouterArgs.multimodal_rdma_listen_ip,
+            help="Routable IP advertised by the multimodal RDMA exporter",
+        )
+        parser.add_argument(
+            f"--{prefix}multimodal-rdma-listen-port",
+            type=int,
+            default=RouterArgs.multimodal_rdma_listen_port,
+            help="NIXL metadata listener port for the multimodal RDMA exporter",
+        )
+        parser.add_argument(
+            f"--{prefix}multimodal-rdma-pool-slots",
+            type=int,
+            default=RouterArgs.multimodal_rdma_pool_slots,
+            help="Number of slots in the pre-registered multimodal RDMA arena",
+        )
+        parser.add_argument(
+            f"--{prefix}multimodal-rdma-slot-bytes",
+            type=int,
+            default=RouterArgs.multimodal_rdma_slot_bytes,
+            help="Per-slot byte capacity in the multimodal RDMA arena",
+        )
+        parser.add_argument(
+            f"--{prefix}multimodal-rdma-worker-landing-wait-secs",
+            type=int,
+            default=RouterArgs.multimodal_rdma_worker_landing_wait_secs,
+            help="Worker landing-slot wait used to derive a safe exporter TTL",
+        )
+        parser.add_argument(
+            f"--{prefix}multimodal-rdma-worker-read-timeout-secs",
+            type=int,
+            default=RouterArgs.multimodal_rdma_worker_read_timeout_secs,
+            help="Worker RDMA read timeout used to derive a safe exporter TTL",
+        )
+        parser.add_argument(
+            f"--{prefix}multimodal-rdma-slot-ttl-secs",
+            type=int,
+            default=RouterArgs.multimodal_rdma_slot_ttl_secs,
+            help="Optional exporter slot TTL; must exceed landing wait plus read timeout",
         )
 
         # Logging configuration

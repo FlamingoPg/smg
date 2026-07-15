@@ -11,6 +11,39 @@ pub use smg_data_connector::{
 use super::{validation::ConfigValidator, ConfigResult};
 use crate::{tenant::DEFAULT_TENANT_HEADER_NAME, worker::ConnectionMode};
 
+pub const DEFAULT_MULTIMODAL_SHM_MIN_BYTES: usize = 64 * 1024;
+pub const DEFAULT_MULTIMODAL_IMAGE_MAX_INPUT_BYTES: usize = 256 * 1024 * 1024;
+pub const DEFAULT_MULTIMODAL_RDMA_LISTEN_PORT: u16 = 18_515;
+pub const DEFAULT_MULTIMODAL_RDMA_POOL_SLOTS: usize = 64;
+pub const DEFAULT_MULTIMODAL_RDMA_SLOT_BYTES: usize = 32 * 1024 * 1024;
+pub const DEFAULT_MULTIMODAL_RDMA_WORKER_LANDING_WAIT_SECS: u64 = 120;
+pub const DEFAULT_MULTIMODAL_RDMA_WORKER_READ_TIMEOUT_SECS: u64 = 60;
+pub const MAX_MULTIMODAL_RDMA_ARENA_BYTES: usize = 8 * 1024 * 1024 * 1024;
+
+fn default_multimodal_image_max_input_bytes() -> usize {
+    DEFAULT_MULTIMODAL_IMAGE_MAX_INPUT_BYTES
+}
+
+fn default_multimodal_rdma_listen_port() -> u16 {
+    DEFAULT_MULTIMODAL_RDMA_LISTEN_PORT
+}
+
+fn default_multimodal_rdma_pool_slots() -> usize {
+    DEFAULT_MULTIMODAL_RDMA_POOL_SLOTS
+}
+
+fn default_multimodal_rdma_slot_bytes() -> usize {
+    DEFAULT_MULTIMODAL_RDMA_SLOT_BYTES
+}
+
+fn default_multimodal_rdma_worker_landing_wait_secs() -> u64 {
+    DEFAULT_MULTIMODAL_RDMA_WORKER_LANDING_WAIT_SECS
+}
+
+fn default_multimodal_rdma_worker_read_timeout_secs() -> u64 {
+    DEFAULT_MULTIMODAL_RDMA_WORKER_READ_TIMEOUT_SECS
+}
+
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
@@ -45,15 +78,47 @@ pub struct RouterConfig {
     #[serde(default)]
     pub engine_metrics: bool,
     /// Global multimodal tensor transport mode (`inline` | `shm` | `auto` | `rdma`).
-    /// Per-worker `WorkerSpec.multimodal_tensor_transport` overrides this; when
-    /// unset, falls back to `SMG_MM_TENSOR_TRANSPORT`, then `inline`.
+    /// Per-worker `WorkerSpec.multimodal_tensor_transport` overrides inline,
+    /// shm, and auto selection; RDMA exporter activation is router-wide. When
+    /// unset, the stable default is `inline`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multimodal_tensor_transport: Option<TransportMode>,
     /// Global minimum multimodal tensor size (bytes) before SHM transport is used.
-    /// Per-worker `WorkerSpec.multimodal_shm_min_bytes` overrides this; falls back
-    /// to `SMG_MM_SHM_MIN_BYTES`, then 64 KiB.
+    /// Per-worker `WorkerSpec.multimodal_shm_min_bytes` overrides this; when
+    /// unset, the stable default is 64 KiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multimodal_shm_min_bytes: Option<usize>,
+    /// Host-DRAM budget in MiB for cached preprocessed image tensors. Zero disables it.
+    #[serde(default)]
+    pub multimodal_pixel_cache_mb: usize,
+    /// Emit detailed multimodal preprocessing, assembly, and transport timing logs.
+    #[serde(default)]
+    pub multimodal_log_timing: bool,
+    /// Maximum accepted encoded image payload size before decode.
+    #[serde(default = "default_multimodal_image_max_input_bytes")]
+    pub multimodal_image_max_input_bytes: usize,
+    /// Router-wide TokenSpeed image encoder-input wire dtype. A worker label can
+    /// still supply the dtype when this is unset; the stable default is bfloat16.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multimodal_image_encoder_input_dtype: Option<String>,
+    /// Routable address advertised by the gateway's multimodal RDMA exporter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multimodal_rdma_listen_ip: Option<String>,
+    #[serde(default = "default_multimodal_rdma_listen_port")]
+    pub multimodal_rdma_listen_port: u16,
+    #[serde(default = "default_multimodal_rdma_pool_slots")]
+    pub multimodal_rdma_pool_slots: usize,
+    #[serde(default = "default_multimodal_rdma_slot_bytes")]
+    pub multimodal_rdma_slot_bytes: usize,
+    /// Worker-side maximum wait for an RDMA landing slot. The gateway uses this
+    /// explicit contract, together with read timeout, to derive a safe slot TTL.
+    #[serde(default = "default_multimodal_rdma_worker_landing_wait_secs")]
+    pub multimodal_rdma_worker_landing_wait_secs: u64,
+    #[serde(default = "default_multimodal_rdma_worker_read_timeout_secs")]
+    pub multimodal_rdma_worker_read_timeout_secs: u64,
+    /// Optional exporter slot TTL. Must exceed landing wait plus read timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multimodal_rdma_slot_ttl_secs: Option<u64>,
     pub dp_aware: bool,
     #[serde(default)]
     pub dp_minimum_tokens_scheduler: bool,
@@ -756,6 +821,19 @@ impl Default for RouterConfig {
             engine_metrics: false,
             multimodal_tensor_transport: None,
             multimodal_shm_min_bytes: None,
+            multimodal_pixel_cache_mb: 0,
+            multimodal_log_timing: false,
+            multimodal_image_max_input_bytes: DEFAULT_MULTIMODAL_IMAGE_MAX_INPUT_BYTES,
+            multimodal_image_encoder_input_dtype: None,
+            multimodal_rdma_listen_ip: None,
+            multimodal_rdma_listen_port: DEFAULT_MULTIMODAL_RDMA_LISTEN_PORT,
+            multimodal_rdma_pool_slots: DEFAULT_MULTIMODAL_RDMA_POOL_SLOTS,
+            multimodal_rdma_slot_bytes: DEFAULT_MULTIMODAL_RDMA_SLOT_BYTES,
+            multimodal_rdma_worker_landing_wait_secs:
+                DEFAULT_MULTIMODAL_RDMA_WORKER_LANDING_WAIT_SECS,
+            multimodal_rdma_worker_read_timeout_secs:
+                DEFAULT_MULTIMODAL_RDMA_WORKER_READ_TIMEOUT_SECS,
+            multimodal_rdma_slot_ttl_secs: None,
             dp_aware: false,
             dp_minimum_tokens_scheduler: false,
             api_key: None,

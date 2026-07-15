@@ -33,7 +33,6 @@ const _: () = assert!(DEFAULT_VIDEO_MAX_INPUT_BYTES < DEFAULT_VIDEO_MAX_DECODED_
 static VIDEO_DECODE_BACKEND: OnceLock<Option<String>> = OnceLock::new();
 static LOG_VIDEO_DECODE_TIMING: OnceLock<bool> = OnceLock::new();
 static VIDEO_PROCESS_TIMEOUT: OnceLock<Duration> = OnceLock::new();
-static IMAGE_MAX_INPUT_BYTES: OnceLock<usize> = OnceLock::new();
 static VIDEO_MAX_INPUT_BYTES: OnceLock<usize> = OnceLock::new();
 static VIDEO_MAX_DECODED_BYTES: OnceLock<usize> = OnceLock::new();
 static AUDIO_MAX_INPUT_BYTES: OnceLock<usize> = OnceLock::new();
@@ -67,6 +66,8 @@ pub struct MediaConnectorConfig {
     pub allowed_domains: Option<Vec<String>>,
     pub allowed_local_media_path: Option<PathBuf>,
     pub fetch_timeout: Duration,
+    /// Maximum accepted encoded image payload size before decode.
+    pub image_max_input_bytes: usize,
 }
 
 impl Default for MediaConnectorConfig {
@@ -75,6 +76,7 @@ impl Default for MediaConnectorConfig {
             allowed_domains: None,
             allowed_local_media_path: None,
             fetch_timeout: Duration::from_secs(10),
+            image_max_input_bytes: DEFAULT_IMAGE_MAX_INPUT_BYTES,
         }
     }
 }
@@ -123,6 +125,7 @@ pub struct MediaConnector {
     allowed_domains: Option<HashSet<String>>,
     allowed_local_media_path: Option<PathBuf>,
     fetch_timeout: Duration,
+    image_max_input_bytes: usize,
 }
 
 impl MediaConnector {
@@ -145,6 +148,7 @@ impl MediaConnector {
             allowed_domains,
             allowed_local_media_path,
             fetch_timeout: config.fetch_timeout,
+            image_max_input_bytes: config.image_max_input_bytes,
         })
     }
 
@@ -217,7 +221,7 @@ impl MediaConnector {
         })?;
 
         let resp = resp.error_for_status()?;
-        let bytes = collect_http_body_with_limit(resp, image_max_input_bytes(), "image").await?;
+        let bytes = collect_http_body_with_limit(resp, self.image_max_input_bytes, "image").await?;
         self.decode_image(
             bytes,
             cfg.detail,
@@ -244,7 +248,7 @@ impl MediaConnector {
         }
 
         let data = data.trim();
-        let decoded = decode_base64_with_limit(data, image_max_input_bytes(), "image")?;
+        let decoded = decode_base64_with_limit(data, self.image_max_input_bytes, "image")?;
         self.decode_image(decoded.into(), cfg.detail, ImageSource::DataUrl)
             .await
     }
@@ -307,7 +311,7 @@ impl MediaConnector {
             ));
         }
 
-        let bytes = read_file_with_limit(&canonical, image_max_input_bytes(), "image").await?;
+        let bytes = read_file_with_limit(&canonical, self.image_max_input_bytes, "image").await?;
         self.decode_image(bytes, cfg.detail, ImageSource::File { path: canonical })
             .await
     }
@@ -432,7 +436,7 @@ impl MediaConnector {
         detail: ImageDetail,
         source: ImageSource,
     ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
-        ensure_input_byte_limit(bytes.len(), image_max_input_bytes(), "image")?;
+        ensure_input_byte_limit(bytes.len(), self.image_max_input_bytes, "image")?;
         let hash = crate::hasher::hash_image(&bytes);
 
         // Decode JPEGs through libjpeg-turbo (PIL-compatible defaults: accurate
@@ -602,14 +606,6 @@ fn env_byte_limit(cache: &'static OnceLock<usize>, env_var: &str, default: usize
             .filter(|bytes| *bytes > 0)
             .unwrap_or(default)
     })
-}
-
-fn image_max_input_bytes() -> usize {
-    env_byte_limit(
-        &IMAGE_MAX_INPUT_BYTES,
-        "SMG_IMAGE_MAX_INPUT_BYTES",
-        DEFAULT_IMAGE_MAX_INPUT_BYTES,
-    )
 }
 
 fn video_max_input_bytes() -> usize {
@@ -2082,13 +2078,15 @@ mod tests {
 
     use bytes::Bytes;
     use futures::stream;
+    use reqwest::Client;
 
     use super::{
         checked_payload_length, collect_http_body_with_limit, decode_base64_with_limit,
         effective_sample_fps, ensure_input_byte_limit, expected_sampled_frame_count,
         fps_filter_for_metadata, parse_ffmpeg_duration_seconds, parse_ffprobe_video_info,
         parse_ppm_stream, read_file_with_limit, split_png_stream, video_temp_suffix,
-        MediaConnectorError, VideoFetchConfig, VideoMetadata,
+        ImageFetchConfig, MediaConnector, MediaConnectorConfig, MediaConnectorError, MediaSource,
+        VideoFetchConfig, VideoMetadata,
     };
 
     const TINY_PNG: &[u8] = &[
@@ -2240,6 +2238,31 @@ mod tests {
         }
 
         assert!(checked_payload_length(usize::MAX, 1, usize::MAX, "audio").is_err());
+    }
+
+    #[tokio::test]
+    async fn connector_enforces_explicit_image_payload_limit() {
+        let connector = MediaConnector::new(
+            Client::new(),
+            MediaConnectorConfig {
+                image_max_input_bytes: 4,
+                ..MediaConnectorConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            connector
+                .fetch_image(
+                    MediaSource::InlineBytes(vec![0; 5]),
+                    ImageFetchConfig::default(),
+                )
+                .await,
+            Err(MediaConnectorError::PayloadTooLarge {
+                media: "image",
+                limit: 4
+            })
+        ));
     }
 
     #[test]

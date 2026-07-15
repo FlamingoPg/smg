@@ -9,6 +9,10 @@ use smg::{
         DiscoveryConfig, HealthCheckConfig, HistoryBackend, ManualAssignmentMode, MetricsConfig,
         OracleConfig, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig,
         RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TokenizerCacheConfig, TraceConfig,
+        DEFAULT_MULTIMODAL_IMAGE_MAX_INPUT_BYTES, DEFAULT_MULTIMODAL_RDMA_LISTEN_PORT,
+        DEFAULT_MULTIMODAL_RDMA_POOL_SLOTS, DEFAULT_MULTIMODAL_RDMA_SLOT_BYTES,
+        DEFAULT_MULTIMODAL_RDMA_WORKER_LANDING_WAIT_SECS,
+        DEFAULT_MULTIMODAL_RDMA_WORKER_READ_TIMEOUT_SECS,
     },
     observability::{
         metrics::PrometheusConfig,
@@ -316,8 +320,9 @@ struct CliArgs {
     engine_metrics: bool,
 
     /// Multimodal tensor transport mode: `inline` (default), `shm` (same-host
-    /// /dev/shm), or `auto` (shm only when the worker shares /dev/shm). A
-    /// per-worker `WorkerSpec.multimodal_tensor_transport` overrides this.
+    /// /dev/shm), `auto` (shm only when the worker shares /dev/shm), or `rdma`.
+    /// A per-worker `WorkerSpec.multimodal_tensor_transport` overrides inline,
+    /// shm, and auto selection; RDMA exporter activation is router-wide.
     #[arg(long, value_parser = parse_transport_mode, help_heading = "Multimodal")]
     multimodal_tensor_transport: Option<TransportMode>,
 
@@ -325,6 +330,80 @@ struct CliArgs {
     /// Overridable per worker via `WorkerSpec.multimodal_shm_min_bytes`.
     #[arg(long, help_heading = "Multimodal")]
     multimodal_shm_min_bytes: Option<usize>,
+
+    /// Host-DRAM budget in MiB for cached preprocessed image tensors. Zero disables it.
+    #[arg(long, default_value_t = 0, help_heading = "Multimodal")]
+    multimodal_pixel_cache_mb: usize,
+
+    /// Log detailed multimodal preprocessing, assembly, and transport timing.
+    #[arg(long, default_value_t = false, help_heading = "Multimodal")]
+    multimodal_log_timing: bool,
+
+    /// Maximum accepted encoded image payload size before decode.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MULTIMODAL_IMAGE_MAX_INPUT_BYTES,
+        help_heading = "Multimodal"
+    )]
+    multimodal_image_max_input_bytes: usize,
+
+    /// Router-wide TokenSpeed image encoder-input wire dtype. When unset, the
+    /// worker-advertised dtype wins, then the stable bfloat16 default.
+    #[arg(
+        long,
+        value_parser = ["float32", "bfloat16", "float16"],
+        help_heading = "Multimodal"
+    )]
+    multimodal_image_encoder_input_dtype: Option<String>,
+
+    /// Routable IP advertised by the multimodal RDMA exporter. Required when
+    /// `--multimodal-tensor-transport rdma` is selected.
+    #[arg(long, help_heading = "Multimodal RDMA")]
+    multimodal_rdma_listen_ip: Option<String>,
+
+    /// NIXL metadata listener port for the multimodal RDMA exporter.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MULTIMODAL_RDMA_LISTEN_PORT,
+        help_heading = "Multimodal RDMA"
+    )]
+    multimodal_rdma_listen_port: u16,
+
+    /// Number of slots in the pre-registered multimodal RDMA arena.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MULTIMODAL_RDMA_POOL_SLOTS,
+        help_heading = "Multimodal RDMA"
+    )]
+    multimodal_rdma_pool_slots: usize,
+
+    /// Per-slot byte capacity in the multimodal RDMA arena.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MULTIMODAL_RDMA_SLOT_BYTES,
+        help_heading = "Multimodal RDMA"
+    )]
+    multimodal_rdma_slot_bytes: usize,
+
+    /// Worker-side maximum landing-slot wait used to derive a safe exporter TTL.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MULTIMODAL_RDMA_WORKER_LANDING_WAIT_SECS,
+        help_heading = "Multimodal RDMA"
+    )]
+    multimodal_rdma_worker_landing_wait_secs: u64,
+
+    /// Worker-side maximum RDMA read time used to derive a safe exporter TTL.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MULTIMODAL_RDMA_WORKER_READ_TIMEOUT_SECS,
+        help_heading = "Multimodal RDMA"
+    )]
+    multimodal_rdma_worker_read_timeout_secs: u64,
+
+    /// Optional exporter slot TTL. It must exceed landing wait plus read timeout.
+    #[arg(long, help_heading = "Multimodal RDMA")]
+    multimodal_rdma_slot_ttl_secs: Option<u64>,
 
     // ==================== Service Discovery (Kubernetes) ====================
     /// Enable Kubernetes service discovery
@@ -1358,6 +1437,17 @@ impl CliArgs {
             .engine_metrics(self.engine_metrics)
             .multimodal_tensor_transport(self.multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
+            .multimodal_pixel_cache_mb(self.multimodal_pixel_cache_mb)
+            .multimodal_log_timing(self.multimodal_log_timing)
+            .multimodal_image_max_input_bytes(self.multimodal_image_max_input_bytes)
+            .multimodal_image_encoder_input_dtype(self.multimodal_image_encoder_input_dtype.clone())
+            .multimodal_rdma_listen_ip(self.multimodal_rdma_listen_ip.clone())
+            .multimodal_rdma_listen_port(self.multimodal_rdma_listen_port)
+            .multimodal_rdma_pool_slots(self.multimodal_rdma_pool_slots)
+            .multimodal_rdma_slot_bytes(self.multimodal_rdma_slot_bytes)
+            .multimodal_rdma_worker_landing_wait_secs(self.multimodal_rdma_worker_landing_wait_secs)
+            .multimodal_rdma_worker_read_timeout_secs(self.multimodal_rdma_worker_read_timeout_secs)
+            .multimodal_rdma_slot_ttl_secs(self.multimodal_rdma_slot_ttl_secs)
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
@@ -1737,6 +1827,27 @@ mod tests {
             "shm",
             "--multimodal-shm-min-bytes",
             "1024",
+            "--multimodal-pixel-cache-mb",
+            "256",
+            "--multimodal-log-timing",
+            "--multimodal-image-max-input-bytes",
+            "1048576",
+            "--multimodal-image-encoder-input-dtype",
+            "float16",
+            "--multimodal-rdma-listen-ip",
+            "10.0.0.8",
+            "--multimodal-rdma-listen-port",
+            "19000",
+            "--multimodal-rdma-pool-slots",
+            "8",
+            "--multimodal-rdma-slot-bytes",
+            "16777216",
+            "--multimodal-rdma-worker-landing-wait-secs",
+            "30",
+            "--multimodal-rdma-worker-read-timeout-secs",
+            "20",
+            "--multimodal-rdma-slot-ttl-secs",
+            "90",
         ]);
 
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
@@ -1746,6 +1857,25 @@ mod tests {
             "transport mode must reach RouterConfig via to_router_config"
         );
         assert_eq!(router_config.multimodal_shm_min_bytes, Some(1024));
+        assert_eq!(router_config.multimodal_pixel_cache_mb, 256);
+        assert!(router_config.multimodal_log_timing);
+        assert_eq!(router_config.multimodal_image_max_input_bytes, 1_048_576);
+        assert_eq!(
+            router_config
+                .multimodal_image_encoder_input_dtype
+                .as_deref(),
+            Some("float16")
+        );
+        assert_eq!(
+            router_config.multimodal_rdma_listen_ip.as_deref(),
+            Some("10.0.0.8")
+        );
+        assert_eq!(router_config.multimodal_rdma_listen_port, 19_000);
+        assert_eq!(router_config.multimodal_rdma_pool_slots, 8);
+        assert_eq!(router_config.multimodal_rdma_slot_bytes, 16_777_216);
+        assert_eq!(router_config.multimodal_rdma_worker_landing_wait_secs, 30);
+        assert_eq!(router_config.multimodal_rdma_worker_read_timeout_secs, 20);
+        assert_eq!(router_config.multimodal_rdma_slot_ttl_secs, Some(90));
 
         let server_config = cli.to_server_config(router_config).unwrap();
         assert_eq!(
@@ -1756,6 +1886,22 @@ mod tests {
         assert_eq!(
             server_config.router_config.multimodal_shm_min_bytes,
             Some(1024)
+        );
+        assert_eq!(server_config.router_config.multimodal_pixel_cache_mb, 256);
+        assert!(server_config.router_config.multimodal_log_timing);
+        assert_eq!(
+            server_config
+                .router_config
+                .multimodal_image_encoder_input_dtype
+                .as_deref(),
+            Some("float16")
+        );
+        assert_eq!(
+            server_config
+                .router_config
+                .multimodal_rdma_listen_ip
+                .as_deref(),
+            Some("10.0.0.8")
         );
     }
 

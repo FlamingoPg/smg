@@ -11,7 +11,8 @@ use llm_multimodal::{
 };
 use tracing::{debug, warn};
 
-use super::pixel_cache::{pixel_cache_from_env, PixelCache};
+use super::pixel_cache::{pixel_cache_from_megabytes, PixelCache};
+use crate::config::RouterConfig;
 
 /// Cached model configuration files loaded from the tokenizer directory.
 #[derive(Debug, Clone)]
@@ -211,20 +212,29 @@ pub(crate) struct MultimodalComponents {
 impl MultimodalComponents {
     /// Create multimodal components with default registries and a reference
     /// to the shared `MultimodalConfigRegistry` owned by `AppContext`.
-    pub fn new(config_registry: Arc<MultimodalConfigRegistry>) -> Result<Self> {
+    pub fn new(
+        config_registry: Arc<MultimodalConfigRegistry>,
+        router_config: &RouterConfig,
+    ) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .context("Failed to create reqwest client")?;
-        let media_connector = MediaConnector::new(client, MediaConnectorConfig::default())
-            .context("Failed to create MediaConnector")?;
+        let media_connector = MediaConnector::new(
+            client,
+            MediaConnectorConfig {
+                image_max_input_bytes: router_config.multimodal_image_max_input_bytes,
+                ..MediaConnectorConfig::default()
+            },
+        )
+        .context("Failed to create MediaConnector")?;
 
         Ok(Self {
             media_connector: Arc::new(media_connector),
             vision_processor_registry: Arc::new(VisionProcessorRegistry::with_defaults()),
             model_registry: Arc::new(ModelRegistry::default()),
             config_registry,
-            pixel_cache: pixel_cache_from_env(),
+            pixel_cache: pixel_cache_from_megabytes(router_config.multimodal_pixel_cache_mb),
         })
     }
 }

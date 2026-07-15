@@ -58,6 +58,7 @@ fn test_connector(allowed_path: Option<PathBuf>) -> MediaConnector {
             allowed_domains: None,
             allowed_local_media_path: allowed_path,
             fetch_timeout: Duration::from_secs(5),
+            ..MediaConnectorConfig::default()
         },
     )
     .expect("media connector")

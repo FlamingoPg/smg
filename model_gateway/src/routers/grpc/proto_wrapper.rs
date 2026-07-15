@@ -39,7 +39,7 @@ use smg_grpc_client::{
 };
 use smg_mm_rdma::RdmaExporter;
 
-use crate::routers::grpc::multimodal::mm_rdma_exporter;
+use crate::routers::grpc::multimodal::{log_mm_timing_enabled, mm_rdma_exporter};
 
 /// Backend-neutral encode->prefill bootstrap info for one multimodal item.
 ///
@@ -514,7 +514,7 @@ fn resolve_mm_tensor_payload(
     rdma: Option<MmRdmaExport<'_>>,
 ) -> MmTensorPayload {
     use crate::observability::metrics::Metrics;
-    let log_timing = log_tokenspeed_mm_timing_enabled();
+    let log_timing = log_mm_timing_enabled();
 
     // RDMA first; on export failure the bytes are handed back so we fall through to
     // SHM/inline rather than drop the payload.
@@ -598,15 +598,6 @@ fn vllm_tensor_payload(
         MmTensorPayload::Shm(handle) => vllm::tensor_data::Payload::Shm(handle),
         MmTensorPayload::Remote(handle) => vllm::tensor_data::Payload::Remote(handle),
     }
-}
-
-fn log_tokenspeed_mm_timing_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SMG_LOG_MM_TIMING")
-            .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false)
-    })
 }
 
 static TOKENSPEED_SHM_COUNTER: AtomicU64 = AtomicU64::new(0);

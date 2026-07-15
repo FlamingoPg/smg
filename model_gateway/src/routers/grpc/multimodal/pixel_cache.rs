@@ -1,10 +1,7 @@
 //! Host-DRAM LRU cache of preprocessed per-image encoder inputs for the gateway
-//! multimodal path. Disabled by default (`SMG_MM_PIXEL_CACHE_MB` unset / 0).
+//! multimodal path. Disabled by default (an explicit zero-MiB budget).
 
-use std::{
-    mem::size_of,
-    sync::{Arc, OnceLock},
-};
+use std::{mem::size_of, sync::Arc};
 
 use llm_multimodal::{ModelSpecificValue, PreprocessedEncoderInputs};
 use lru::LruCache;
@@ -132,26 +129,17 @@ impl PixelCache {
     }
 }
 
-pub(crate) fn pixel_cache_from_env() -> Option<Arc<PixelCache>> {
-    static CACHE: OnceLock<Option<Arc<PixelCache>>> = OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            let mb = std::env::var("SMG_MM_PIXEL_CACHE_MB")
-                .ok()
-                .and_then(|raw| raw.trim().parse::<usize>().ok())
-                .unwrap_or(0);
-            if mb == 0 {
-                return None;
-            }
-            let max_bytes = mb.saturating_mul(1024 * 1024);
-            tracing::info!(
-                target: "smg::request",
-                cache_mb = mb,
-                "multimodal pixel_values cache enabled (host DRAM, preprocessed encoder inputs)"
-            );
-            Some(Arc::new(PixelCache::new(max_bytes)))
-        })
-        .clone()
+pub(crate) fn pixel_cache_from_megabytes(megabytes: usize) -> Option<Arc<PixelCache>> {
+    if megabytes == 0 {
+        return None;
+    }
+    let max_bytes = megabytes.saturating_mul(1024 * 1024);
+    tracing::info!(
+        target: "smg::request",
+        cache_mb = megabytes,
+        "multimodal pixel_values cache enabled (host DRAM, preprocessed encoder inputs)"
+    );
+    Some(Arc::new(PixelCache::new(max_bytes)))
 }
 
 pub(crate) fn config_fingerprint(tokenizer_id: &str, config: &serde_json::Value) -> u64 {
@@ -189,6 +177,13 @@ mod tests {
             image_hash: hash.to_string(),
             config_fingerprint: 7,
         }
+    }
+
+    #[test]
+    fn explicit_zero_budget_disables_cache() {
+        assert!(pixel_cache_from_megabytes(0).is_none());
+        let cache = pixel_cache_from_megabytes(1).expect("one MiB enables the cache");
+        assert_eq!(cache.inner.lock().max_bytes, 1024 * 1024);
     }
 
     #[test]

@@ -25,6 +25,7 @@ impl ConfigValidator {
         Self::validate_mode(&config.mode)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_server_settings(config)?;
+        Self::validate_multimodal(config)?;
         Self::validate_storage_context_headers(config)?;
         Self::validate_tenant_resolution(config)?;
         if let Some(discovery) = &config.discovery {
@@ -459,6 +460,121 @@ impl ConfigValidator {
                     .to_string(),
             }),
         }
+    }
+
+    fn validate_multimodal(config: &RouterConfig) -> ConfigResult<()> {
+        if config.multimodal_image_max_input_bytes == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "multimodal_image_max_input_bytes".to_string(),
+                value: config.multimodal_image_max_input_bytes.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+
+        if let Some(dtype) = config.multimodal_image_encoder_input_dtype.as_deref() {
+            let canonical = dtype.trim().to_ascii_lowercase();
+            if !matches!(
+                canonical.as_str(),
+                "float32"
+                    | "f32"
+                    | "fp32"
+                    | "bfloat16"
+                    | "bf16"
+                    | "float16"
+                    | "fp16"
+                    | "f16"
+                    | "half"
+            ) {
+                return Err(ConfigError::InvalidValue {
+                    field: "multimodal_image_encoder_input_dtype".to_string(),
+                    value: dtype.to_string(),
+                    reason: "expected float32, bfloat16, or float16".to_string(),
+                });
+            }
+        }
+
+        if config.multimodal_rdma_listen_port == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "multimodal_rdma_listen_port".to_string(),
+                value: "0".to_string(),
+                reason: "Port must be > 0".to_string(),
+            });
+        }
+        if config.multimodal_rdma_pool_slots == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "multimodal_rdma_pool_slots".to_string(),
+                value: "0".to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+        if config.multimodal_rdma_slot_bytes == 0
+            || config.multimodal_rdma_slot_bytes > MAX_MULTIMODAL_RDMA_ARENA_BYTES
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "multimodal_rdma_slot_bytes".to_string(),
+                value: config.multimodal_rdma_slot_bytes.to_string(),
+                reason: format!("Must be between 1 and {MAX_MULTIMODAL_RDMA_ARENA_BYTES}"),
+            });
+        }
+        if config
+            .multimodal_rdma_pool_slots
+            .checked_mul(config.multimodal_rdma_slot_bytes)
+            .is_none_or(|bytes| bytes > MAX_MULTIMODAL_RDMA_ARENA_BYTES)
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "multimodal_rdma_pool_slots".to_string(),
+                value: config.multimodal_rdma_pool_slots.to_string(),
+                reason: format!(
+                    "pool slots times slot bytes must not exceed {MAX_MULTIMODAL_RDMA_ARENA_BYTES}"
+                ),
+            });
+        }
+
+        if config.multimodal_rdma_worker_landing_wait_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "multimodal_rdma_worker_landing_wait_secs".to_string(),
+                value: "0".to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+        if config.multimodal_rdma_worker_read_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "multimodal_rdma_worker_read_timeout_secs".to_string(),
+                value: "0".to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+        let worker_max_hold = config
+            .multimodal_rdma_worker_landing_wait_secs
+            .checked_add(config.multimodal_rdma_worker_read_timeout_secs)
+            .ok_or_else(|| ConfigError::InvalidValue {
+                field: "multimodal_rdma_worker_landing_wait_secs".to_string(),
+                value: config.multimodal_rdma_worker_landing_wait_secs.to_string(),
+                reason: "landing wait plus read timeout must fit in u64".to_string(),
+            })?;
+        if let Some(slot_ttl) = config.multimodal_rdma_slot_ttl_secs {
+            if slot_ttl <= worker_max_hold {
+                return Err(ConfigError::InvalidValue {
+                    field: "multimodal_rdma_slot_ttl_secs".to_string(),
+                    value: slot_ttl.to_string(),
+                    reason: format!(
+                        "Must exceed the configured worker maximum hold ({worker_max_hold} seconds)"
+                    ),
+                });
+            }
+        }
+        if config.multimodal_tensor_transport == Some(TransportMode::Rdma)
+            && config
+                .multimodal_rdma_listen_ip
+                .as_deref()
+                .is_none_or(|ip| ip.trim().is_empty())
+        {
+            return Err(ConfigError::MissingRequired {
+                field: "multimodal_rdma_listen_ip".to_string(),
+            });
+        }
+
+        Ok(())
     }
 
     fn validate_server_settings(config: &RouterConfig) -> ConfigResult<()> {
@@ -1469,5 +1585,63 @@ mod tests {
         assert!(ConfigValidator::validate(&config).is_ok());
         config.health_check_port = None;
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_explicit_multimodal_image_config() {
+        let mut config = RouterConfig {
+            multimodal_image_max_input_bytes: 0,
+            ..RouterConfig::default()
+        };
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, .. })
+                if field == "multimodal_image_max_input_bytes"
+        ));
+
+        config.multimodal_image_max_input_bytes = DEFAULT_MULTIMODAL_IMAGE_MAX_INPUT_BYTES;
+        config.multimodal_image_encoder_input_dtype = Some("int8".to_string());
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, .. })
+                if field == "multimodal_image_encoder_input_dtype"
+        ));
+
+        config.multimodal_image_encoder_input_dtype = Some("bfloat16".to_string());
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_explicit_multimodal_rdma_contract() {
+        let mut config = RouterConfig {
+            multimodal_tensor_transport: Some(TransportMode::Rdma),
+            ..RouterConfig::default()
+        };
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::MissingRequired { ref field })
+                if field == "multimodal_rdma_listen_ip"
+        ));
+
+        config.multimodal_rdma_listen_ip = Some("10.0.0.8".to_string());
+        config.multimodal_rdma_worker_landing_wait_secs = 120;
+        config.multimodal_rdma_worker_read_timeout_secs = 60;
+        config.multimodal_rdma_slot_ttl_secs = Some(180);
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, .. })
+                if field == "multimodal_rdma_slot_ttl_secs"
+        ));
+
+        config.multimodal_rdma_slot_ttl_secs = Some(181);
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        config.multimodal_rdma_pool_slots =
+            MAX_MULTIMODAL_RDMA_ARENA_BYTES / config.multimodal_rdma_slot_bytes + 1;
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, .. })
+                if field == "multimodal_rdma_pool_slots"
+        ));
     }
 }

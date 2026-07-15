@@ -44,6 +44,64 @@ class TestRouterArgs:
         assert args.disable_retries is False
         assert args.disable_circuit_breaker is False
         assert args.mesh_advertise_host is None
+        assert args.multimodal_tensor_transport is None
+        assert args.multimodal_shm_min_bytes is None
+        assert args.multimodal_pixel_cache_mb == 0
+        assert args.multimodal_log_timing is False
+        assert args.multimodal_image_max_input_bytes == 256 * 1024 * 1024
+        assert args.multimodal_image_encoder_input_dtype is None
+        assert args.multimodal_rdma_listen_ip is None
+        assert args.multimodal_rdma_listen_port == 18_515
+        assert args.multimodal_rdma_pool_slots == 64
+        assert args.multimodal_rdma_slot_bytes == 32 * 1024 * 1024
+        assert args.multimodal_rdma_worker_landing_wait_secs == 120
+        assert args.multimodal_rdma_worker_read_timeout_secs == 60
+        assert args.multimodal_rdma_slot_ttl_secs is None
+
+    def test_parse_explicit_multimodal_runtime_config(self):
+        args = parse_router_args(
+            [
+                "--multimodal-tensor-transport",
+                "rdma",
+                "--multimodal-shm-min-bytes",
+                "1024",
+                "--multimodal-pixel-cache-mb",
+                "256",
+                "--multimodal-log-timing",
+                "--multimodal-image-max-input-bytes",
+                "1048576",
+                "--multimodal-image-encoder-input-dtype",
+                "float16",
+                "--multimodal-rdma-listen-ip",
+                "10.0.0.8",
+                "--multimodal-rdma-listen-port",
+                "19000",
+                "--multimodal-rdma-pool-slots",
+                "8",
+                "--multimodal-rdma-slot-bytes",
+                "16777216",
+                "--multimodal-rdma-worker-landing-wait-secs",
+                "30",
+                "--multimodal-rdma-worker-read-timeout-secs",
+                "20",
+                "--multimodal-rdma-slot-ttl-secs",
+                "90",
+            ]
+        )
+
+        assert args.multimodal_tensor_transport == "rdma"
+        assert args.multimodal_shm_min_bytes == 1024
+        assert args.multimodal_pixel_cache_mb == 256
+        assert args.multimodal_log_timing is True
+        assert args.multimodal_image_max_input_bytes == 1_048_576
+        assert args.multimodal_image_encoder_input_dtype == "float16"
+        assert args.multimodal_rdma_listen_ip == "10.0.0.8"
+        assert args.multimodal_rdma_listen_port == 19_000
+        assert args.multimodal_rdma_pool_slots == 8
+        assert args.multimodal_rdma_slot_bytes == 16_777_216
+        assert args.multimodal_rdma_worker_landing_wait_secs == 30
+        assert args.multimodal_rdma_worker_read_timeout_secs == 20
+        assert args.multimodal_rdma_slot_ttl_secs == 90
 
     def test_parse_selector_valid(self):
         """Test parsing valid selector arguments."""

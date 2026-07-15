@@ -226,6 +226,62 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Host-DRAM budget in MiB for cached preprocessed image tensors.
+    pub fn multimodal_pixel_cache_mb(mut self, megabytes: usize) -> Self {
+        self.config.multimodal_pixel_cache_mb = megabytes;
+        self
+    }
+
+    pub fn multimodal_log_timing(mut self, enabled: bool) -> Self {
+        self.config.multimodal_log_timing = enabled;
+        self
+    }
+
+    pub fn multimodal_image_max_input_bytes(mut self, bytes: usize) -> Self {
+        self.config.multimodal_image_max_input_bytes = bytes;
+        self
+    }
+
+    pub fn multimodal_image_encoder_input_dtype(mut self, dtype: Option<String>) -> Self {
+        self.config.multimodal_image_encoder_input_dtype = dtype;
+        self
+    }
+
+    pub fn multimodal_rdma_listen_ip(mut self, ip: Option<String>) -> Self {
+        self.config.multimodal_rdma_listen_ip = ip;
+        self
+    }
+
+    pub fn multimodal_rdma_listen_port(mut self, port: u16) -> Self {
+        self.config.multimodal_rdma_listen_port = port;
+        self
+    }
+
+    pub fn multimodal_rdma_pool_slots(mut self, slots: usize) -> Self {
+        self.config.multimodal_rdma_pool_slots = slots;
+        self
+    }
+
+    pub fn multimodal_rdma_slot_bytes(mut self, bytes: usize) -> Self {
+        self.config.multimodal_rdma_slot_bytes = bytes;
+        self
+    }
+
+    pub fn multimodal_rdma_worker_landing_wait_secs(mut self, seconds: u64) -> Self {
+        self.config.multimodal_rdma_worker_landing_wait_secs = seconds;
+        self
+    }
+
+    pub fn multimodal_rdma_worker_read_timeout_secs(mut self, seconds: u64) -> Self {
+        self.config.multimodal_rdma_worker_read_timeout_secs = seconds;
+        self
+    }
+
+    pub fn multimodal_rdma_slot_ttl_secs(mut self, seconds: Option<u64>) -> Self {
+        self.config.multimodal_rdma_slot_ttl_secs = seconds;
+        self
+    }
+
     // ==================== Rate Limiting ====================
 
     pub fn max_concurrent_requests(mut self, max: i32) -> Self {

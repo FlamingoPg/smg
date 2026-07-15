@@ -13,10 +13,7 @@
 //! - [`transport`]: SHM-vs-inline transport resolution and `/dev/shm`
 //!   namespace verification.
 
-use std::{
-    collections::HashSet,
-    sync::{Arc, OnceLock},
-};
+use std::{collections::HashSet, sync::Arc};
 
 use llm_multimodal::{
     AudioClip, EncoderFieldLayouts, ImageFrame, Modality, PlaceholderRange,
@@ -47,19 +44,7 @@ pub(crate) use plan::{
     prepare_placeholder_tokens, validate_rendered_media_anchors, PlaceholderTokens,
 };
 pub(crate) use process::process_multimodal_plan;
-pub(crate) use transport::{init_mm_transport_defaults, mm_rdma_exporter};
-
-/// Whether verbose multimodal timing logs are enabled via `SMG_LOG_MM_TIMING`.
-/// Read from the environment once and cached; the flag is not expected to change
-/// at runtime, and this is called on every multimodal request.
-fn log_mm_timing_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SMG_LOG_MM_TIMING")
-            .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false)
-    })
-}
+pub(crate) use transport::{init_mm_runtime_config, log_mm_timing_enabled, mm_rdma_exporter};
 
 /// Output of the multimodal processing pipeline.
 pub(crate) struct MultimodalOutput {

@@ -1002,13 +1002,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         ))
     };
 
-    // Seed the process-wide multimodal tensor transport defaults from the
-    // resolved router config; per-worker specs still override at request time.
-    use crate::routers::grpc::multimodal::init_mm_transport_defaults;
-    init_mm_transport_defaults(
-        config.router_config.multimodal_tensor_transport,
-        config.router_config.multimodal_shm_min_bytes,
-    );
+    // Seed the process-wide multimodal runtime policy from the resolved router
+    // config; supported per-worker settings still override at request time.
+    use crate::routers::grpc::multimodal::init_mm_runtime_config;
+    init_mm_runtime_config(&config.router_config);
 
     // Start the metrics server. It binds the port eagerly so we fail fast on
     // port conflicts or bad addresses.

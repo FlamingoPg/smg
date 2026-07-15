@@ -6,9 +6,8 @@
 //!
 //! Resolution precedence for the transport mode and SHM threshold:
 //! per-worker `WorkerSpec` override → router config (seeded once at startup via
-//! [`init_mm_transport_defaults`]) → `SMG_MM_*` env (with the legacy
-//! `SMG_TOKENSPEED_MM_*` names as a fallback) → built-in default (`inline`,
-//! 64 KiB).
+//! [`init_mm_runtime_config`]) → built-in default (`inline`, 64 KiB). Product
+//! environment variables are deliberately not part of runtime configuration.
 
 use std::{
     sync::{Arc, OnceLock},
@@ -20,111 +19,95 @@ use openai_protocol::worker::TransportMode;
 use smg_mm_rdma::{RdmaConfig, RdmaExporter};
 use tracing::{error, info, warn};
 
-use crate::routers::grpc::{context::WorkerSelection, proto_wrapper::mm_shm_dev_writable};
+use crate::{
+    config::{
+        RouterConfig, DEFAULT_MULTIMODAL_RDMA_LISTEN_PORT, DEFAULT_MULTIMODAL_RDMA_POOL_SLOTS,
+        DEFAULT_MULTIMODAL_RDMA_SLOT_BYTES, DEFAULT_MULTIMODAL_RDMA_WORKER_LANDING_WAIT_SECS,
+        DEFAULT_MULTIMODAL_RDMA_WORKER_READ_TIMEOUT_SECS, DEFAULT_MULTIMODAL_SHM_MIN_BYTES,
+        MAX_MULTIMODAL_RDMA_ARENA_BYTES,
+    },
+    routers::grpc::{context::WorkerSelection, proto_wrapper::mm_shm_dev_writable},
+};
 
-const DEFAULT_SHM_MIN_BYTES: usize = 64 * 1024;
+#[derive(Debug, Clone)]
+struct MmRdmaRuntimeConfig {
+    listen_ip: Option<String>,
+    listen_port: u16,
+    pool_slots: usize,
+    slot_bytes: usize,
+    worker_landing_wait_secs: u64,
+    worker_read_timeout_secs: u64,
+    slot_ttl_secs: Option<u64>,
+}
 
-/// Router-level transport defaults, resolved once at startup from `RouterConfig`
-/// (falling back to env, then built-in defaults). Per-worker `WorkerSpec`
-/// overrides take precedence over these at request time.
-#[derive(Debug, Clone, Copy)]
-struct MmTransportDefaults {
+impl Default for MmRdmaRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            listen_ip: None,
+            listen_port: DEFAULT_MULTIMODAL_RDMA_LISTEN_PORT,
+            pool_slots: DEFAULT_MULTIMODAL_RDMA_POOL_SLOTS,
+            slot_bytes: DEFAULT_MULTIMODAL_RDMA_SLOT_BYTES,
+            worker_landing_wait_secs: DEFAULT_MULTIMODAL_RDMA_WORKER_LANDING_WAIT_SECS,
+            worker_read_timeout_secs: DEFAULT_MULTIMODAL_RDMA_WORKER_READ_TIMEOUT_SECS,
+            slot_ttl_secs: None,
+        }
+    }
+}
+
+/// Process-wide multimodal runtime policy projected from the validated
+/// [`RouterConfig`] before requests are served.
+#[derive(Debug, Clone)]
+struct MmRuntimeConfig {
     mode: TransportMode,
     shm_min_bytes: usize,
+    log_timing: bool,
+    image_encoder_input_dtype: Option<String>,
+    rdma: MmRdmaRuntimeConfig,
 }
 
-static DEFAULTS: OnceLock<MmTransportDefaults> = OnceLock::new();
+impl Default for MmRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            mode: TransportMode::default(),
+            shm_min_bytes: DEFAULT_MULTIMODAL_SHM_MIN_BYTES,
+            log_timing: false,
+            image_encoder_input_dtype: None,
+            rdma: MmRdmaRuntimeConfig::default(),
+        }
+    }
+}
 
-/// Seed the process-wide transport defaults from router config. Config values
-/// win; unset values fall back to env, then the built-in defaults. Call once at
-/// startup before serving; idempotent (first call wins).
-pub(crate) fn init_mm_transport_defaults(
-    mode: Option<TransportMode>,
-    shm_min_bytes: Option<usize>,
-) {
-    let resolved = MmTransportDefaults {
-        mode: mode
-            .or_else(mm_tensor_transport_mode_from_env)
-            .unwrap_or_default(),
-        shm_min_bytes: shm_min_bytes
-            .or_else(mm_shm_min_bytes_from_env)
-            .unwrap_or(DEFAULT_SHM_MIN_BYTES),
+static RUNTIME_CONFIG: OnceLock<MmRuntimeConfig> = OnceLock::new();
+static FALLBACK_RUNTIME_CONFIG: OnceLock<MmRuntimeConfig> = OnceLock::new();
+
+/// Seed the process-wide multimodal policy from the validated router config.
+/// Call once at startup before serving; idempotent (first call wins).
+pub(crate) fn init_mm_runtime_config(config: &RouterConfig) {
+    let resolved = MmRuntimeConfig {
+        mode: config.multimodal_tensor_transport.unwrap_or_default(),
+        shm_min_bytes: config
+            .multimodal_shm_min_bytes
+            .unwrap_or(DEFAULT_MULTIMODAL_SHM_MIN_BYTES),
+        log_timing: config.multimodal_log_timing,
+        image_encoder_input_dtype: config.multimodal_image_encoder_input_dtype.clone(),
+        rdma: MmRdmaRuntimeConfig {
+            listen_ip: config.multimodal_rdma_listen_ip.clone(),
+            listen_port: config.multimodal_rdma_listen_port,
+            pool_slots: config.multimodal_rdma_pool_slots,
+            slot_bytes: config.multimodal_rdma_slot_bytes,
+            worker_landing_wait_secs: config.multimodal_rdma_worker_landing_wait_secs,
+            worker_read_timeout_secs: config.multimodal_rdma_worker_read_timeout_secs,
+            slot_ttl_secs: config.multimodal_rdma_slot_ttl_secs,
+        },
     };
-    let _ = DEFAULTS.set(resolved);
-    log_transport_config_once(resolved);
+    let _ = RUNTIME_CONFIG.set(resolved);
+    log_transport_config_once(mm_runtime_config());
 }
 
-/// The resolved router-level defaults. If [`init_mm_transport_defaults`] was
-/// never called (e.g. in tests), resolve lazily from env + built-in defaults.
-fn mm_transport_defaults() -> MmTransportDefaults {
-    if let Some(defaults) = DEFAULTS.get() {
-        return *defaults;
-    }
-    MmTransportDefaults {
-        mode: mm_tensor_transport_mode_from_env().unwrap_or_default(),
-        shm_min_bytes: mm_shm_min_bytes_from_env().unwrap_or(DEFAULT_SHM_MIN_BYTES),
-    }
-}
-
-fn mm_tensor_transport_mode_from_env() -> Option<TransportMode> {
-    static LEGACY_WARNED: OnceLock<()> = OnceLock::new();
-    let raw = env_with_deprecated_alias(
-        "SMG_MM_TENSOR_TRANSPORT",
-        "SMG_TOKENSPEED_MM_TENSOR_TRANSPORT",
-        &LEGACY_WARNED,
-    )?;
-    match TransportMode::parse(&raw) {
-        Some(mode) => Some(mode),
-        None => {
-            log_unknown_transport_once(&raw);
-            None
-        }
-    }
-}
-
-fn mm_shm_min_bytes_from_env() -> Option<usize> {
-    static LEGACY_WARNED: OnceLock<()> = OnceLock::new();
-    let raw = env_with_deprecated_alias(
-        "SMG_MM_SHM_MIN_BYTES",
-        "SMG_TOKENSPEED_MM_SHM_MIN_BYTES",
-        &LEGACY_WARNED,
-    )?;
-    match raw.parse::<usize>() {
-        Ok(value) => Some(value),
-        Err(_) => {
-            log_invalid_shm_min_bytes_once(&raw);
-            None
-        }
-    }
-}
-
-/// Read the canonical env var, falling back to the deprecated alias. When the
-/// value comes from the alias, log a one-time migration warning (guarded by
-/// `warned`, one warning per variable).
-fn env_with_deprecated_alias(
-    canonical: &str,
-    deprecated: &str,
-    warned: &OnceLock<()>,
-) -> Option<String> {
-    if let Some(value) = read_env_nonempty(canonical) {
-        return Some(value);
-    }
-    let value = read_env_nonempty(deprecated)?;
-    warned.get_or_init(|| {
-        warn!(
-            deprecated,
-            canonical,
-            "Deprecated multimodal transport env var is set; migrate to the canonical name"
-        );
-    });
-    Some(value)
-}
-
-fn read_env_nonempty(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+fn mm_runtime_config() -> &'static MmRuntimeConfig {
+    RUNTIME_CONFIG
+        .get()
+        .unwrap_or_else(|| FALLBACK_RUNTIME_CONFIG.get_or_init(MmRuntimeConfig::default))
 }
 
 /// Resolve whether large multimodal tensors should use the SHM transport for
@@ -136,8 +119,7 @@ pub(super) fn resolve_mm_shm_enabled(
     workers: Option<&WorkerSelection>,
     skip_pixel_values: bool,
 ) -> bool {
-    let mode =
-        worker_transport_mode_override(workers).unwrap_or_else(|| mm_transport_defaults().mode);
+    let mode = worker_transport_mode_override(workers).unwrap_or_else(|| mm_runtime_config().mode);
     match mode {
         TransportMode::Shm => mm_shm_dev_writable(),
         TransportMode::Auto => {
@@ -151,38 +133,32 @@ pub(super) fn resolve_mm_shm_enabled(
 /// Resolve the SHM size threshold (bytes) for this request: per-worker override
 /// → router default.
 pub(super) fn resolve_mm_shm_min_bytes(workers: Option<&WorkerSelection>) -> usize {
-    worker_shm_min_bytes_override(workers).unwrap_or_else(|| mm_transport_defaults().shm_min_bytes)
+    worker_shm_min_bytes_override(workers).unwrap_or_else(|| mm_runtime_config().shm_min_bytes)
 }
 
 // ===================== RDMA pixel lane =====================
 //
 // The gateway owns all RDMA *policy*: it decides whether the lane is on (a
-// first-class `TransportMode::Rdma`, with the legacy `SMG_MM_PIXEL_RDMA` env as a
-// backward-compatible fallback), parses the env-derived `RdmaConfig`, and builds
+// first-class `TransportMode::Rdma`), builds an injected `RdmaConfig`, and owns
 // the single process-wide exporter. The engine-neutral `smg-mm-rdma` crate owns
 // only the NIXL mechanics + wire format; it reads no env and no globals. In the
 // default (stub) build the exporter is inert, so every export falls back to inline.
 
 /// Fixed agent name the encode worker passes to `fetch_remote_metadata`.
 const RDMA_GATEWAY_AGENT_NAME: &str = "smg-gateway-encode";
-/// Default arena geometry: 64 slots x 32 MiB = 2 GiB host DRAM. A slot must hold
-/// one image's framed pixel buffer; raise `SMG_RDMA_SLOT_BYTES` for larger images.
-const DEFAULT_RDMA_POOL_SLOTS: usize = 64;
-const DEFAULT_RDMA_SLOT_BYTES: usize = 32 * 1024 * 1024;
 /// Upper bound on the pre-registered arena (`pool_slots * slot_bytes`). A plausible
-/// env misconfiguration (huge `SMG_RDMA_POOL_SLOTS` x `SMG_RDMA_SLOT_BYTES`) would
+/// configuration error (huge pool-slots x slot-bytes) would
 /// otherwise flow into a single `vec![0u8; total]` whose allocation failure aborts
 /// the process instead of falling back to inline. 8 GiB is well above the 2 GiB
 /// default and any realistic pool.
-const MAX_RDMA_ARENA_BYTES: usize = 8 * 1024 * 1024 * 1024;
 /// Fixed slack added to the derived worker-max-hold when deriving the slot TTL.
-/// A const rather than an env knob: it only ever widens the lost-notif leak window
+/// A const rather than a separate knob: it only ever widens the lost-notif leak window
 /// (a capacity nit, never correctness -- the crate's per-lease gen framing makes a
 /// recycled-under-read slot detectable independent of the TTL), and 30s dwarfs any
-/// Encode-RPC delivery jitter. `SMG_RDMA_SLOT_TTL_S` remains the full-TTL override.
+/// Encode-RPC delivery jitter.
 const RDMA_SLOT_TTL_SLACK: Duration = Duration::from_secs(30);
 
-/// Process-wide RDMA pixel exporter, built lazily on first use from env-derived
+/// Process-wide RDMA pixel exporter, built lazily on first use from explicit
 /// config when the RDMA lane is enabled. `None` when the lane is off or NIXL init
 /// fails (callers then stay on the inline path).
 pub(crate) fn mm_rdma_exporter() -> Option<&'static RdmaExporter> {
@@ -192,13 +168,13 @@ pub(crate) fn mm_rdma_exporter() -> Option<&'static RdmaExporter> {
             if !rdma_lane_enabled() {
                 return None;
             }
-            let cfg = build_rdma_config_from_env();
+            let cfg = build_rdma_config(&mm_runtime_config().rdma);
             if cfg.listen_ip.is_empty() {
                 // Without a listener IP the worker can't do the cross-node metadata
                 // exchange, so every export would fall back to inline anyway. Skip
                 // building the NIXL agent + (2 GiB default) arena for nothing.
                 warn!(
-                    "EPD RDMA: lane enabled but SMG_RDMA_LISTEN_IP is unset; staying on the inline path"
+                    "EPD RDMA: lane enabled without --multimodal-rdma-listen-ip; staying on the inline path"
                 );
                 return None;
             }
@@ -213,52 +189,40 @@ pub(crate) fn mm_rdma_exporter() -> Option<&'static RdmaExporter> {
         .as_ref()
 }
 
-/// Whether the RDMA pixel lane is active: the first-class `TransportMode::Rdma`
-/// (`--multimodal-tensor-transport rdma` / `SMG_MM_TENSOR_TRANSPORT=rdma`), with
-/// the legacy `SMG_MM_PIXEL_RDMA` env as a backward-compatible fallback.
+/// Whether the RDMA pixel lane is active via the first-class
+/// `--multimodal-tensor-transport rdma` policy.
 fn rdma_lane_enabled() -> bool {
-    mm_transport_defaults().mode == TransportMode::Rdma
-        || matches!(
-            std::env::var("SMG_MM_PIXEL_RDMA").as_deref(),
-            Ok("1") | Ok("true")
-        )
+    mm_runtime_config().mode == TransportMode::Rdma
 }
 
-/// Build the exporter config from the `SMG_RDMA_*` env knobs. All RDMA policy lives
-/// here; the crate consumes the resulting [`RdmaConfig`] verbatim.
-fn build_rdma_config_from_env() -> RdmaConfig {
-    // Bound both slot size and count so the arena stays within MAX_RDMA_ARENA_BYTES:
-    // a fat-fingered env pair must not turn into an unbounded startup allocation.
-    let slot_bytes =
-        rdma_env_positive("SMG_RDMA_SLOT_BYTES", DEFAULT_RDMA_SLOT_BYTES).min(MAX_RDMA_ARENA_BYTES);
-    let pool_slots = clamp_pool_slots(
-        rdma_env_positive("SMG_RDMA_POOL_SLOTS", DEFAULT_RDMA_POOL_SLOTS),
-        slot_bytes,
-    );
+/// Build the exporter config from validated router configuration.
+fn build_rdma_config(config: &MmRdmaRuntimeConfig) -> RdmaConfig {
+    let slot_bytes = config.slot_bytes.min(MAX_MULTIMODAL_RDMA_ARENA_BYTES);
+    let pool_slots = clamp_pool_slots(config.pool_slots, slot_bytes);
     RdmaConfig {
         // Empty listener IP => the exporter cannot do the cross-node metadata
         // exchange, so the caller stays on the inline path (checked before we build
         // the exporter in `mm_rdma_exporter`).
-        listen_ip: std::env::var("SMG_RDMA_LISTEN_IP").unwrap_or_default(),
-        listen_port: rdma_env_parse("SMG_RDMA_LISTEN_PORT", 18515),
+        listen_ip: config.listen_ip.clone().unwrap_or_default(),
+        listen_port: config.listen_port,
         agent_name: RDMA_GATEWAY_AGENT_NAME.to_string(),
         pool_slots,
         slot_bytes,
-        slot_ttl: derive_rdma_slot_ttl(),
+        slot_ttl: derive_rdma_slot_ttl(config),
     }
 }
 
 /// Clamp the slot count so the arena (`pool_slots * slot_bytes`) stays within
-/// [`MAX_RDMA_ARENA_BYTES`], bounding the startup allocation. Keeps at least one
+/// [`MAX_MULTIMODAL_RDMA_ARENA_BYTES`], bounding the startup allocation. Keeps at least one
 /// slot; warns when it has to reduce an oversized request.
 fn clamp_pool_slots(pool_slots: usize, slot_bytes: usize) -> usize {
-    let max_slots = (MAX_RDMA_ARENA_BYTES / slot_bytes.max(1)).max(1);
+    let max_slots = (MAX_MULTIMODAL_RDMA_ARENA_BYTES / slot_bytes.max(1)).max(1);
     if pool_slots > max_slots {
         warn!(
             requested = pool_slots,
             capped = max_slots,
             slot_bytes,
-            max_arena_bytes = MAX_RDMA_ARENA_BYTES,
+            max_arena_bytes = MAX_MULTIMODAL_RDMA_ARENA_BYTES,
             "EPD RDMA: requested pixel arena exceeds the cap; reducing slot count"
         );
         return max_slots;
@@ -267,14 +231,13 @@ fn clamp_pool_slots(pool_slots: usize, slot_bytes: usize) -> usize {
 }
 
 /// The worst-case wall time the encode worker may hold a shipped descriptor before
-/// and during its one-sided READ: it waits up to `SMG_RDMA_LANDING_WAIT_S` for a
-/// free landing slot, then READs for up to `SMG_RDMA_READ_TIMEOUT_S`. These mirror
-/// the encode servicer's own knobs (same env names, same defaults) so the two sides
-/// cannot drift. The gateway must not reclaim a slot inside this window.
-fn worker_max_hold() -> Duration {
+/// and during its one-sided READ: it waits for a landing slot and then performs
+/// the READ. These explicit values must match the TokenSpeed worker flags.
+fn worker_max_hold(config: &MmRdmaRuntimeConfig) -> Duration {
     Duration::from_secs(
-        rdma_env_parse::<u64>("SMG_RDMA_LANDING_WAIT_S", 120)
-            + rdma_env_parse::<u64>("SMG_RDMA_READ_TIMEOUT_S", 60),
+        config
+            .worker_landing_wait_secs
+            .saturating_add(config.worker_read_timeout_secs),
     )
 }
 
@@ -282,16 +245,13 @@ fn worker_max_hold() -> Duration {
 /// force-reclaims it. MUST exceed [`worker_max_hold`] or the TTL races a still-valid
 /// READ: the reaper frees the slot, the next image re-leases the SAME address, and
 /// the late READ silently returns the WRONG image's pixels. Derived by default
-/// (= `worker_max_hold` + [`RDMA_SLOT_TTL_SLACK`]); `SMG_RDMA_SLOT_TTL_S` overrides,
-/// but an override that does not exceed the hold is rejected (see [`resolve_slot_ttl`]).
-fn derive_rdma_slot_ttl() -> Duration {
-    let override_secs = std::env::var("SMG_RDMA_SLOT_TTL_S")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok());
-    resolve_slot_ttl(override_secs, worker_max_hold())
+/// (= `worker_max_hold` + [`RDMA_SLOT_TTL_SLACK`]); an explicit full-TTL override
+/// must exceed the hold (see [`resolve_slot_ttl`]).
+fn derive_rdma_slot_ttl(config: &MmRdmaRuntimeConfig) -> Duration {
+    resolve_slot_ttl(config.slot_ttl_secs, worker_max_hold(config))
 }
 
-/// Apply the TTL invariant to an optional `SMG_RDMA_SLOT_TTL_S` override: honor it
+/// Apply the TTL invariant to an optional explicit full-TTL override: honor it
 /// only if it strictly exceeds `hold` (otherwise the reaper could reclaim a slot the
 /// worker is still READing and cross-wire images). A too-small override is ignored
 /// with a warning in favor of the derived `hold + RDMA_SLOT_TTL_SLACK`. Pure (takes
@@ -305,28 +265,10 @@ fn resolve_slot_ttl(override_secs: Option<u64>, hold: Duration) -> Duration {
         warn!(
             ttl_s = secs,
             hold_s = hold.as_secs(),
-            "SMG_RDMA_SLOT_TTL_S must exceed the worker's max hold; ignoring override"
+            "multimodal RDMA slot TTL must exceed the worker's max hold; ignoring override"
         );
     }
     hold + RDMA_SLOT_TTL_SLACK
-}
-
-/// Parse a numeric env knob, falling back to `default` when unset or unparsable.
-fn rdma_env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
-/// Parse a positive `usize` env knob, falling back to `default` when unset,
-/// unparsable, or zero.
-fn rdma_env_positive(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(default)
 }
 
 fn worker_transport_mode_override(workers: Option<&WorkerSelection>) -> Option<TransportMode> {
@@ -366,51 +308,23 @@ pub(super) fn mm_encoder_input_dtype(
     workers: Option<&WorkerSelection>,
 ) -> String {
     resolve_mm_encoder_input_dtype(
-        mm_modality_encoder_input_dtype_from_env(modality),
-        mm_default_encoder_input_dtype_from_env(),
+        match modality {
+            Modality::Image | Modality::ImageEmbeds => {
+                mm_runtime_config().image_encoder_input_dtype.clone()
+            }
+            Modality::Video | Modality::Audio => None,
+        },
         mm_encoder_input_dtype_from_worker(workers),
     )
 }
 
 fn resolve_mm_encoder_input_dtype(
-    modality_override: Option<String>,
-    default_override: Option<String>,
+    router_override: Option<String>,
     worker_dtype: Option<String>,
 ) -> String {
-    // Use one configurable wire policy across modalities, with an optional
-    // per-modality override for encoder contracts that require another dtype.
-    modality_override
-        .or(default_override)
+    router_override
         .or(worker_dtype)
         .unwrap_or_else(|| "bfloat16".to_string())
-}
-
-fn mm_modality_encoder_input_dtype_from_env(modality: Modality) -> Option<String> {
-    static IMAGE_DTYPE: OnceLock<Option<String>> = OnceLock::new();
-    static VIDEO_DTYPE: OnceLock<Option<String>> = OnceLock::new();
-    static AUDIO_DTYPE: OnceLock<Option<String>> = OnceLock::new();
-
-    match modality {
-        Modality::Image | Modality::ImageEmbeds => {
-            cached_env_dtype(&IMAGE_DTYPE, "SMG_TOKENSPEED_IMAGE_ENCODER_INPUT_DTYPE")
-        }
-        Modality::Video => {
-            cached_env_dtype(&VIDEO_DTYPE, "SMG_TOKENSPEED_VIDEO_ENCODER_INPUT_DTYPE")
-        }
-        Modality::Audio => {
-            cached_env_dtype(&AUDIO_DTYPE, "SMG_TOKENSPEED_AUDIO_ENCODER_INPUT_DTYPE")
-        }
-    }
-}
-
-fn mm_default_encoder_input_dtype_from_env() -> Option<String> {
-    static DEFAULT_DTYPE: OnceLock<Option<String>> = OnceLock::new();
-    cached_env_dtype(&DEFAULT_DTYPE, "SMG_TOKENSPEED_ENCODER_INPUT_DTYPE")
-}
-
-fn cached_env_dtype(cell: &'static OnceLock<Option<String>>, name: &str) -> Option<String> {
-    cell.get_or_init(|| std::env::var(name).ok().filter(|dtype| !dtype.is_empty()))
-        .clone()
 }
 
 fn mm_encoder_input_dtype_from_worker(workers: Option<&WorkerSelection>) -> Option<String> {
@@ -423,34 +337,20 @@ fn mm_encoder_input_dtype_from_worker(workers: Option<&WorkerSelection>) -> Opti
         .cloned()
 }
 
-fn log_transport_config_once(defaults: MmTransportDefaults) {
+pub(crate) fn log_mm_timing_enabled() -> bool {
+    mm_runtime_config().log_timing
+}
+
+fn log_transport_config_once(config: &MmRuntimeConfig) {
     static LOGGED: OnceLock<()> = OnceLock::new();
     LOGGED.get_or_init(|| {
         info!(
-            mode = %defaults.mode,
-            shm_min_bytes = defaults.shm_min_bytes,
+            mode = %config.mode,
+            shm_min_bytes = config.shm_min_bytes,
+            log_timing = config.log_timing,
+            image_encoder_input_dtype = ?config.image_encoder_input_dtype,
             dev_writable = mm_shm_dev_writable(),
             "Multimodal tensor transport configured"
-        );
-    });
-}
-
-fn log_unknown_transport_once(value: &str) {
-    static WARNED: OnceLock<()> = OnceLock::new();
-    WARNED.get_or_init(|| {
-        warn!(
-            value,
-            "Unknown multimodal tensor transport value; expected inline|shm|auto|rdma, using inline"
-        );
-    });
-}
-
-fn log_invalid_shm_min_bytes_once(value: &str) {
-    static WARNED: OnceLock<()> = OnceLock::new();
-    WARNED.get_or_init(|| {
-        warn!(
-            value,
-            "Invalid multimodal SHM min-bytes value; expected a non-negative integer, using default"
         );
     });
 }
@@ -537,28 +437,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn modality_dtype_precedes_global_then_worker_with_bfloat16_fallback() {
+    fn router_dtype_precedes_worker_with_bfloat16_fallback() {
         assert_eq!(
             resolve_mm_encoder_input_dtype(
                 Some("float16".to_string()),
-                Some("float32".to_string()),
                 Some("bfloat16".to_string()),
             ),
             "float16"
         );
         assert_eq!(
-            resolve_mm_encoder_input_dtype(
-                None,
-                Some("float32".to_string()),
-                Some("bfloat16".to_string()),
-            ),
-            "float32"
-        );
-        assert_eq!(
-            resolve_mm_encoder_input_dtype(None, None, Some("bfloat16".to_string()),),
+            resolve_mm_encoder_input_dtype(None, Some("bfloat16".to_string())),
             "bfloat16"
         );
-        assert_eq!(resolve_mm_encoder_input_dtype(None, None, None), "bfloat16");
+        assert_eq!(resolve_mm_encoder_input_dtype(None, None), "bfloat16");
     }
 
     /// The derived slot TTL must strictly exceed the worker's max hold, so the
@@ -567,15 +458,16 @@ mod tests {
     /// tests cover the mechanics; this pins the gateway's TTL-derivation policy.
     #[test]
     fn derived_rdma_slot_ttl_exceeds_worker_max_hold() {
+        let config = MmRdmaRuntimeConfig::default();
         assert!(
-            derive_rdma_slot_ttl() > worker_max_hold(),
+            derive_rdma_slot_ttl(&config) > worker_max_hold(&config),
             "slot_ttl {:?} must exceed worker_max_hold {:?} or a late READ cross-wires",
-            derive_rdma_slot_ttl(),
-            worker_max_hold()
+            derive_rdma_slot_ttl(&config),
+            worker_max_hold(&config)
         );
     }
 
-    /// The `SMG_RDMA_SLOT_TTL_S` override is honored only when it exceeds the worker
+    /// The explicit slot-TTL override is honored only when it exceeds the worker
     /// hold; a too-small (or absent) value falls back to the derived `hold + slack`,
     /// so an operator can never silently reintroduce the recycled-under-READ bug.
     #[test]
@@ -599,7 +491,7 @@ mod tests {
     fn pool_slots_capped_to_arena_max() {
         let slot_bytes = 1024 * 1024 * 1024; // 1 GiB
         let capped = clamp_pool_slots(1_000_000, slot_bytes);
-        assert_eq!(capped, MAX_RDMA_ARENA_BYTES / slot_bytes);
+        assert_eq!(capped, MAX_MULTIMODAL_RDMA_ARENA_BYTES / slot_bytes);
         assert!(capped >= 1, "must keep at least one slot");
         assert_eq!(clamp_pool_slots(64, 32 * 1024 * 1024), 64);
     }
