@@ -35,6 +35,12 @@ def launch_engine(
             "launch_engine() returned no AsyncLLM — only rank 0 may serve gRPC traffic."
         )
 
+    # The gRPC server owns SIGINT/SIGTERM and drives AsyncLLM.close() from its
+    # deterministic shutdown path. Starting AsyncLLM's private signal
+    # watchdog here would race that owner and can terminate the process before
+    # gRPC has drained active RPCs.
+    async_llm.auto_create_handle_loop(manage_signals=False)
+
     logger.info(
         "TokenSpeed engine ready: max_total_num_tokens=%s max_req_input_len=%s",
         scheduler_info.get("max_total_num_tokens"),

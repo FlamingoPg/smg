@@ -42,6 +42,7 @@ from smg_grpc_servicer.kv_events import endpoint_for_rank, stream_kv_events
 from smg_grpc_servicer.mm_rdma import RdmaPixelPuller
 from smg_grpc_servicer.tokenspeed.health_servicer import TokenSpeedHealthServicer
 from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
+from smg_grpc_servicer.tokenspeed.rdma_config import rdma_pixel_config_from_server_args
 
 if TYPE_CHECKING:
     # Type-only — keeps these out of the cold-path graph when the servicer is
@@ -51,24 +52,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-HEALTH_CHECK_TIMEOUT = int(os.getenv("TOKENSPEED_HEALTH_CHECK_TIMEOUT", "20"))
 # Profile round-trips include trace serialization, which can take minutes.
 PROFILE_TIMEOUT = 600.0
-LOG_MM_TENSOR_DATA = os.getenv("TOKENSPEED_LOG_MM_TENSOR_DATA", "").lower() in (
-    "1",
-    "true",
-    "yes",
-)
-LOG_MM_TIMING = os.getenv("TOKENSPEED_LOG_MM_TIMING", "").lower() in (
-    "1",
-    "true",
-    "yes",
-)
-UNLINK_MM_SHM_AFTER_READ = os.getenv("TOKENSPEED_UNLINK_MM_SHM_AFTER_READ", "1").lower() not in (
-    "0",
-    "false",
-    "no",
-)
 
 
 def _lazy_generate_req_input():
@@ -128,22 +113,19 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         self.scheduler_info = scheduler_info
         self.health_servicer = health_servicer
         self.start_time = time.time()
+        self._health_check_timeout = server_args.health_check_timeout
+        self._log_mm_tensor_data = server_args.log_mm_tensor_data
+        self._log_mm_timing = server_args.enable_log_mm_timing
+        self._unlink_mm_shm_after_read = server_args.unlink_mm_shm_after_read
 
         # Resolved ZMQ KV-events endpoint, or None when the worker was not
         # launched with --kv-events-config (SubscribeKvEvents → UNIMPLEMENTED).
         self._kv_events_config = resolve_kv_events_config(server_args)
         self._rdma_pixel_puller = RdmaPixelPuller(
-            agent_name=(
-                f"smg-scheduler-{getattr(server_args, 'host', 'unknown')}-"
-                f"{getattr(server_args, 'port', 'unknown')}"
-            ),
+            agent_name=f"smg-scheduler-{server_args.host}-{server_args.port}",
             log_prefix="TokenSpeed RDMA",
+            config=rdma_pixel_config_from_server_args(server_args),
         )
-
-        # Drive AsyncLLM's output-dispatch loop. This is idempotent — the
-        # first caller creates the handle loop; subsequent callers (including
-        # the HealthCheck RPC) are no-ops thanks to ``no_create_loop``.
-        self.async_llm.auto_create_handle_loop()
 
         logger.info("TokenSpeedSchedulerServicer initialized")
 
@@ -162,7 +144,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         try:
             build_started = time.perf_counter()
             req_obj = self._build_generate_req(request)
-            if LOG_MM_TIMING:
+            if self._log_mm_timing:
                 has_mm = getattr(req_obj, "precomputed_multimodal_inputs", None) is not None
                 logger.info(
                     "mm_timing generate_build_ms rid=%s elapsed=%.3f has_mm=%s",
@@ -191,7 +173,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             engine_started = time.perf_counter()
             first_output = True
             async for output in self.async_llm.generate_request(req_obj):
-                if LOG_MM_TIMING and first_output:
+                if self._log_mm_timing and first_output:
                     first_output = False
                     logger.info(
                         "mm_timing generate_first_output_ms rid=%s elapsed=%.3f",
@@ -287,7 +269,8 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
     ) -> tokenspeed_scheduler_pb2.HealthCheckResponse:
         """Deep health probe — sends a 1-token generation to the scheduler.
 
-        Any scheduler push within ``HEALTH_CHECK_TIMEOUT`` counts as alive.
+        Any scheduler push within the configured health-check timeout counts as
+        alive.
         ``log_metrics=False`` so health checks don't skew Prometheus counters.
         """
         rid = f"HEALTH_CHECK_{time.time()}"
@@ -330,7 +313,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
 
         task = asyncio.create_task(_drive_probe())
         try:
-            while time.time() - tic < HEALTH_CHECK_TIMEOUT:
+            while time.time() - tic < self._health_check_timeout:
                 await asyncio.sleep(0.5)
                 # Any scheduler push after we started counts as healthy.
                 if self.async_llm.last_receive_tstamp > tic:
@@ -355,7 +338,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
 
         return tokenspeed_scheduler_pb2.HealthCheckResponse(
             healthy=False,
-            message=f"Health check timeout after {HEALTH_CHECK_TIMEOUT}s",
+            message=f"Health check timeout after {self._health_check_timeout}s",
         )
 
     # ------------------------------------------------------------------
@@ -568,12 +551,13 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         """
         try:
             load_outputs = await asyncio.wait_for(
-                self.async_llm.get_load(), timeout=HEALTH_CHECK_TIMEOUT
+                self.async_llm.get_load(), timeout=self._health_check_timeout
             )
         except TimeoutError:
             await context.abort(
                 grpc.StatusCode.DEADLINE_EXCEEDED,
-                f"tokenspeed scheduler did not respond to GetLoad within {HEALTH_CHECK_TIMEOUT}s",
+                "tokenspeed scheduler did not respond to GetLoad within "
+                f"{self._health_check_timeout}s",
             )
             return
         except Exception as e:  # noqa: BLE001
@@ -798,22 +782,11 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
     # ------------------------------------------------------------------
 
     async def shutdown(self, drain_timeout_secs: float = 30.0) -> None:
-        """Graceful shutdown — drain in-flight requests, then kill scheduler children.
+        """Stop admission, drain requests, then close the owned AsyncLLM.
 
-        AsyncLLM's ``sigterm_watchdog`` polls ``gracefully_exit`` every 5s,
-        drains ``rid_to_state`` and finally calls
-        ``kill_process_tree(getpid, include_parent=True)``. That works in
-        steady-state but the gRPC server's main coroutine may unwind before
-        the watchdog ticks again, in which case the scheduler subprocesses
-        outlive the parent and end up orphaned. To avoid that, we:
-
-        1. Flag ``gracefully_exit`` so AsyncLLM stops accepting work and
-           the watchdog will eventually run its own cleanup.
-        2. Wait up to ``drain_timeout_secs`` for ``rid_to_state`` to empty.
-        3. Forcibly kill the subprocess tree (``include_parent=False``) so
-           the scheduler children are reaped regardless of whether the
-           watchdog tick fires before this coroutine returns. Idempotent
-           with the watchdog's own ``kill_process_tree`` call.
+        ``AsyncLLM.close`` owns the exact scheduler-child termination and reap
+        sequence. Keeping that process lifecycle below the engine boundary
+        prevents the gRPC adapter from killing unrelated descendants.
         """
         self.async_llm.gracefully_exit = True
         if self.health_servicer:
@@ -821,28 +794,18 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
 
         deadline = time.monotonic() + drain_timeout_secs
         while time.monotonic() < deadline:
-            if not getattr(self.async_llm, "rid_to_state", None):
+            if not self.async_llm.rid_to_state:
                 break
             await asyncio.sleep(0.5)
         else:
             logger.warning(
                 "shutdown drain timed out after %.1fs with %d in-flight requests; "
-                "killing scheduler children anyway",
+                "closing the engine anyway",
                 drain_timeout_secs,
-                len(getattr(self.async_llm, "rid_to_state", {}) or {}),
+                len(self.async_llm.rid_to_state),
             )
 
-        # Reap the scheduler subprocesses without taking down our own PID;
-        # server.py's stop sequence still needs us alive to finish gRPC drain.
-        try:
-            from tokenspeed.runtime.utils.process import kill_process_tree
-        except ImportError:
-            logger.exception(
-                "Could not import tokenspeed.runtime.utils.process.kill_process_tree; "
-                "scheduler subprocesses may be orphaned"
-            )
-            return
-        kill_process_tree(os.getpid(), include_parent=False)
+        await self.async_llm.close()
 
     def _build_generate_req(self, request: tokenspeed_scheduler_pb2.GenerateRequest):
         """Translate proto GenerateRequest → TokenSpeed GenerateReqInput.
@@ -1057,10 +1020,10 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         items = []
         im_token_id = None
         video_token_id = None
-        total_started = time.perf_counter() if LOG_MM_TIMING else None
+        total_started = time.perf_counter() if self._log_mm_timing else None
 
         for item_proto in mm_inputs.items:
-            item_started = time.perf_counter() if LOG_MM_TIMING else None
+            item_started = time.perf_counter() if self._log_mm_timing else None
             modality = self._modality_from_proto(item_proto.modality)
             # EPD prefill items omit encoder_input: the per-item embedding
             # arrives over Mooncake and is written into item.encoded. Keep the
@@ -1069,7 +1032,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             feature = None
             feature_elapsed_ms = None
             if item_proto.HasField("encoder_input"):
-                feature_started = time.perf_counter() if LOG_MM_TIMING else None
+                feature_started = time.perf_counter() if self._log_mm_timing else None
                 encoder_input = item_proto.encoder_input
                 if encoder_input.WhichOneof("payload") == "remote":
                     feature = self._rdma_pixel_puller.feature_from_remote(
@@ -1078,13 +1041,17 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                         cast_to=model_dtype,
                     )
                 else:
-                    feature = self._feature_from_proto(encoder_input, cast_to=model_dtype)
+                    feature = self._feature_from_proto(
+                        encoder_input,
+                        cast_to=model_dtype,
+                        unlink_shm_after_read=self._unlink_mm_shm_after_read,
+                    )
                 feature_elapsed_ms = (
                     (time.perf_counter() - feature_started) * 1000
                     if feature_started is not None
                     else None
                 )
-                if LOG_MM_TENSOR_DATA:
+                if self._log_mm_tensor_data:
                     payload = encoder_input.WhichOneof("payload")
                     inline_nbytes = len(encoder_input.inline) if payload == "inline" else None
                     logger.info(
@@ -1100,12 +1067,15 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                         feature.dtype,
                         model_dtype,
                     )
-            model_started = time.perf_counter() if LOG_MM_TIMING else None
+            model_started = time.perf_counter() if self._log_mm_timing else None
             model_specific_data = {
                 # Side tensors are metadata, not encoder activations. Preserve
                 # their wire dtype: reducing video timing values to BF16 can
                 # change the integer M-RoPE positions at fractional frame rates.
-                name: self._tensor_from_proto(tensor_data)
+                name: self._tensor_from_proto(
+                    tensor_data,
+                    unlink_shm_after_read=self._unlink_mm_shm_after_read,
+                )
                 for name, tensor_data in item_proto.model_specific_tensors.items()
             }
             model_elapsed_ms = (
@@ -1130,7 +1100,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             mm_item.set_pad_value()
             items.append(mm_item)
 
-            if LOG_MM_TIMING and item_started is not None:
+            if self._log_mm_timing and item_started is not None:
                 if item_proto.HasField("encoder_input"):
                     encoder_input = item_proto.encoder_input
                     payload = encoder_input.WhichOneof("payload")
@@ -1171,7 +1141,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
 
         if not items:
             raise ValueError("MultimodalInputs.items is empty")
-        if LOG_MM_TIMING and total_started is not None:
+        if self._log_mm_timing and total_started is not None:
             logger.info(
                 "mm_timing mm_inputs_build_ms items=%d elapsed=%.3f",
                 len(items),
@@ -1224,6 +1194,8 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
     def _tensor_from_proto(
         tensor_data: tokenspeed_scheduler_pb2.TensorData,
         cast_to: torch.dtype | None = None,
+        *,
+        unlink_shm_after_read: bool = True,
     ):
         """Reconstruct a torch.Tensor from a proto TensorData.
 
@@ -1231,7 +1203,10 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         copied so it never aliases the transient proto bytes.
         """
         shape = list(tensor_data.shape)
-        raw = TokenSpeedSchedulerServicer._tensor_payload_bytes(tensor_data)
+        raw = TokenSpeedSchedulerServicer._tensor_payload_bytes(
+            tensor_data,
+            unlink_shm_after_read=unlink_shm_after_read,
+        )
 
         if tensor_data.dtype == "bfloat16":
             # numpy has no bfloat16 — read the raw bits as uint16, reinterpret.
@@ -1262,6 +1237,8 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
     def _feature_from_proto(
         tensor_data: tokenspeed_scheduler_pb2.TensorData,
         cast_to: torch.dtype | None = None,
+        *,
+        unlink_shm_after_read: bool = True,
     ) -> torch.Tensor | ShmTensorHandle:
         """Reconstruct a feature tensor, preserving SHM handles when possible.
 
@@ -1271,7 +1248,11 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         materializing bytes and cloning a CPU tensor.
         """
         if tensor_data.WhichOneof("payload") != "shm":
-            return TokenSpeedSchedulerServicer._tensor_from_proto(tensor_data, cast_to=cast_to)
+            return TokenSpeedSchedulerServicer._tensor_from_proto(
+                tensor_data,
+                cast_to=cast_to,
+                unlink_shm_after_read=unlink_shm_after_read,
+            )
 
         dtype = TokenSpeedSchedulerServicer._torch_dtype_from_proto(tensor_data.dtype)
         if (
@@ -1279,11 +1260,19 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             and dtype != cast_to
             and torch.is_floating_point(torch.empty((), dtype=dtype))
         ):
-            return TokenSpeedSchedulerServicer._tensor_from_proto(tensor_data, cast_to=cast_to)
+            return TokenSpeedSchedulerServicer._tensor_from_proto(
+                tensor_data,
+                cast_to=cast_to,
+                unlink_shm_after_read=unlink_shm_after_read,
+            )
 
         shm = tensor_data.shm
         if shm.offset != 0:
-            return TokenSpeedSchedulerServicer._tensor_from_proto(tensor_data, cast_to=cast_to)
+            return TokenSpeedSchedulerServicer._tensor_from_proto(
+                tensor_data,
+                cast_to=cast_to,
+                unlink_shm_after_read=unlink_shm_after_read,
+            )
 
         shape = tuple(int(dim) for dim in tensor_data.shape)
         expected = int(np.prod(shape, dtype=np.int64)) * torch.empty((), dtype=dtype).element_size()
@@ -1297,12 +1286,19 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         return ShmTensorHandle(shm_name=name, shape=shape, dtype=dtype)
 
     @staticmethod
-    def _tensor_payload_bytes(tensor_data: tokenspeed_scheduler_pb2.TensorData) -> bytes:
+    def _tensor_payload_bytes(
+        tensor_data: tokenspeed_scheduler_pb2.TensorData,
+        *,
+        unlink_shm_after_read: bool = True,
+    ) -> bytes:
         payload = tensor_data.WhichOneof("payload")
         if payload == "inline":
             return bytes(tensor_data.inline)
         if payload == "shm":
-            return TokenSpeedSchedulerServicer._tensor_payload_bytes_from_shm(tensor_data.shm)
+            return TokenSpeedSchedulerServicer._tensor_payload_bytes_from_shm(
+                tensor_data.shm,
+                unlink_shm_after_read=unlink_shm_after_read,
+            )
         if payload == "remote":
             raise ValueError("TensorData.remote payload is not implemented yet")
         raise ValueError("TensorData payload is required")
@@ -1310,6 +1306,8 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
     @staticmethod
     def _tensor_payload_bytes_from_shm(
         shm_handle: common_pb2.ShmHandle,
+        *,
+        unlink_shm_after_read: bool = True,
     ) -> bytes:
         name = TokenSpeedSchedulerServicer._validated_shm_name(shm_handle.name)
 
@@ -1321,7 +1319,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         finally:
             if fd is not None:
                 os.close(fd)
-            if fd is not None and UNLINK_MM_SHM_AFTER_READ:
+            if fd is not None and unlink_shm_after_read:
                 try:
                     os.unlink(path)
                 except FileNotFoundError:

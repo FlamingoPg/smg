@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-import os
+import math
 import queue
 import socket
 import threading
@@ -18,6 +18,44 @@ _FRAME_BYTES = 2 * _GEN_BYTES
 # The gateway's fixed NIXL agent name (see RDMA_GATEWAY_AGENT_NAME gateway-side).
 DEFAULT_GATEWAY_AGENT_NAME = "smg-gateway-encode"
 _LOCAL_IP_CACHE: dict[str, bool] = {}
+
+
+@dataclass(frozen=True)
+class RdmaPixelPullerConfig:
+    """Explicit configuration for the multimodal NIXL READ transport."""
+
+    enabled: bool = False
+    slot_bytes: int = 32 * 1024 * 1024
+    landing_slots: int = 64
+    send_metadata: bool | None = None
+    landing_wait_seconds: float = 120.0
+    read_timeout_seconds: float = 60.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise TypeError("enabled must be a bool")
+        if not isinstance(self.slot_bytes, int) or isinstance(self.slot_bytes, bool):
+            raise TypeError("slot_bytes must be an int")
+        if self.slot_bytes <= 0:
+            raise ValueError("slot_bytes must be positive")
+        if not isinstance(self.landing_slots, int) or isinstance(self.landing_slots, bool):
+            raise TypeError("landing_slots must be an int")
+        if self.landing_slots <= 0:
+            raise ValueError("landing_slots must be positive")
+        if self.send_metadata is not None and not isinstance(self.send_metadata, bool):
+            raise TypeError("send_metadata must be a bool or None")
+        if not isinstance(self.landing_wait_seconds, int | float) or isinstance(
+            self.landing_wait_seconds, bool
+        ):
+            raise TypeError("landing_wait_seconds must be a number")
+        if not math.isfinite(self.landing_wait_seconds) or self.landing_wait_seconds <= 0:
+            raise ValueError("landing_wait_seconds must be positive")
+        if not isinstance(self.read_timeout_seconds, int | float) or isinstance(
+            self.read_timeout_seconds, bool
+        ):
+            raise TypeError("read_timeout_seconds must be a number")
+        if not math.isfinite(self.read_timeout_seconds) or self.read_timeout_seconds <= 0:
+            raise ValueError("read_timeout_seconds must be positive")
 
 
 @dataclass(frozen=True)
@@ -108,10 +146,12 @@ class RdmaPixelPuller:
         *,
         agent_name: str,
         log_prefix: str,
+        config: RdmaPixelPullerConfig,
         gateway_agent_name: str = DEFAULT_GATEWAY_AGENT_NAME,
     ):
         self._log_prefix = log_prefix
         self._gateway_agent_name = gateway_agent_name
+        self._config = config
         self._nixl_agent = None
         self._rdma_md_ready = set()
         self._rdma_md_lock = threading.Lock()
@@ -121,7 +161,7 @@ class RdmaPixelPuller:
         self._landing_slot_bytes = 0
         self._landing_free = None
 
-        if os.environ.get("SMG_MM_PIXEL_RDMA") not in ("1", "true"):
+        if not config.enabled:
             return
 
         try:
@@ -140,8 +180,8 @@ class RdmaPixelPuller:
                 ),
             )
 
-            slot_bytes = int(os.environ.get("SMG_RDMA_SLOT_BYTES", 32 * 1024 * 1024))
-            n_slots = int(os.environ.get("SMG_RDMA_LANDING_SLOTS", 64))
+            slot_bytes = config.slot_bytes
+            n_slots = config.landing_slots
             self._landing = torch.empty(
                 n_slots * slot_bytes,
                 dtype=torch.uint8,
@@ -181,21 +221,17 @@ class RdmaPixelPuller:
             agent = self._nixl_agent
             agent.fetch_remote_metadata(self._gateway_agent_name, ip, port)
 
-            send_md_env = os.environ.get("SMG_RDMA_SEND_MD")
-            if send_md_env in ("1", "true"):
-                do_send_md = True
-            elif send_md_env in ("0", "false"):
-                do_send_md = False
-            else:
-                do_send_md = _ip_is_local(ip)
+            is_local = _ip_is_local(ip)
+            do_send_md = self._config.send_metadata
+            if do_send_md is None:
+                do_send_md = is_local
             logger.info(
-                "%s: gateway %s:%s local=%s send_md=%s (env=%s) -- one-time md handshake",
+                "%s: gateway %s:%s local=%s send_md=%s -- one-time md handshake",
                 self._log_prefix,
                 ip,
                 port,
-                _ip_is_local(ip),
+                is_local,
                 do_send_md,
-                send_md_env,
             )
             if do_send_md:
                 agent.send_local_metadata(ip, port)
@@ -242,7 +278,7 @@ class RdmaPixelPuller:
             descriptor.room,
         )
 
-        wait_budget = float(os.environ.get("SMG_RDMA_LANDING_WAIT_S", 120))
+        wait_budget = self._config.landing_wait_seconds
         t_acq = time.monotonic()
         slot = None
         while slot is None:
@@ -253,8 +289,8 @@ class RdmaPixelPuller:
                 if waited >= wait_budget:
                     raise RuntimeError(
                         f"{self._log_prefix}: landing-ring starvation for {waited:.0f}s "
-                        f"(room={descriptor.room}); raise SMG_RDMA_LANDING_SLOTS / "
-                        f"SMG_RDMA_LANDING_WAIT_S"
+                        f"(room={descriptor.room}); increase landing_slots or "
+                        "landing_wait_seconds"
                     ) from None
                 logger.warning(
                     "%s: landing ring exhausted for %.0fs (room=%s, qsize=%d); backpressuring",
@@ -275,7 +311,7 @@ class RdmaPixelPuller:
                 self._gateway_agent_name,
                 str(descriptor.room).encode(),
             )
-            read_deadline = time.monotonic() + float(os.environ.get("SMG_RDMA_READ_TIMEOUT_S", 60))
+            read_deadline = time.monotonic() + self._config.read_timeout_seconds
             spins = 0
             state = agent.transfer(handle)
             while state in ("PROC", "IN_PROG"):

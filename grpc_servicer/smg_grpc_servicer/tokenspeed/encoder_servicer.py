@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import uuid
 from typing import TYPE_CHECKING
 
@@ -23,6 +22,7 @@ from smg_grpc_proto.generated import (
 )
 
 from smg_grpc_servicer.mm_rdma import RdmaPixelPuller
+from smg_grpc_servicer.tokenspeed.rdma_config import rdma_pixel_config_from_server_args
 from smg_grpc_servicer.tokenspeed.servicer import TokenSpeedSchedulerServicer
 
 if TYPE_CHECKING:
@@ -55,19 +55,13 @@ class TokenSpeedEncoderServicer(tokenspeed_encoder_pb2_grpc.TokenSpeedEncoderSer
         health_servicer=None,
     ):
         self.async_llm = async_llm
-        # EPD_PIXEL_SHM: ship encoder inputs to the scheduler process as POSIX-SHM
+        # Ship encoder inputs to the scheduler process as POSIX-SHM
         # handles instead of pickling the raw tensor over ZMQ (the dominant
-        # per-item ingest cost). On by default (this servicer only runs in the
-        # encode role, where SHM is always the right path); set EPD_PIXEL_SHM=0 to
-        # fall back to the inline ZMQ pickle (e.g. a container with a tiny
-        # /dev/shm). The decision is made once per item in _items_from_proto; the
-        # encode worker materializes (or unlinks, on a cache hit) the segment on
-        # its side.
-        self._pixel_shm = os.environ.get("EPD_PIXEL_SHM", "1").lower() not in (
-            "0",
-            "false",
-            "no",
-        )
+        # per-item ingest cost). Explicit ServerArgs switches support the
+        # inline ZMQ and on-loop fallbacks without process-global state.
+        self._pixel_shm = server_args.epd_pixel_shm
+        self._ingest_offloop = server_args.epd_ingest_offloop
+        self._unlink_mm_shm_after_read = server_args.unlink_mm_shm_after_read
 
         # The encode worker hosts its OWN Mooncake bootstrap server (it is the
         # data source); prefill workers discover it at (this host, the
@@ -80,9 +74,9 @@ class TokenSpeedEncoderServicer(tokenspeed_encoder_pb2_grpc.TokenSpeedEncoderSer
         self._rdma_pixel_puller = RdmaPixelPuller(
             agent_name=f"smg-encode-{self._bootstrap_host}-{self._bootstrap_port}",
             log_prefix="EPD RDMA",
+            config=rdma_pixel_config_from_server_args(server_args),
         )
 
-        self.async_llm.auto_create_handle_loop()
         logger.info("TokenSpeedEncoderServicer initialized")
 
     def _items_from_proto(self, mm_inputs, bootstrap_room: int = 0):
@@ -114,12 +108,15 @@ class TokenSpeedEncoderServicer(tokenspeed_encoder_pb2_grpc.TokenSpeedEncoderSer
             offsets = [(p.offset, p.offset + p.length - 1) for p in item_proto.placeholders]
 
             model_specific = {
-                name: TokenSpeedSchedulerServicer._tensor_from_proto(t)
+                name: TokenSpeedSchedulerServicer._tensor_from_proto(
+                    t,
+                    unlink_shm_after_read=self._unlink_mm_shm_after_read,
+                )
                 for name, t in item_proto.model_specific_tensors.items()
             }
 
             # The feature's CROSS-PROCESS representation is decided here, once, for
-            # both payload arms: a plain CPU tensor by default, or (EPD_PIXEL_SHM) a
+            # both payload arms: a plain CPU tensor by default, or (when enabled) a
             # POSIX-SHM handle so the ZMQ hop to the scheduler pickles ~KB instead of
             # the full encoder tensor. The content hash is computed on the real bytes
             # before the swap and pre-set on the item.
@@ -131,9 +128,13 @@ class TokenSpeedEncoderServicer(tokenspeed_encoder_pb2_grpc.TokenSpeedEncoderSer
                     cast_to=model_dtype,
                 )
             else:
-                feature = TokenSpeedSchedulerServicer._tensor_from_proto(td, cast_to=model_dtype)
+                feature = TokenSpeedSchedulerServicer._tensor_from_proto(
+                    td,
+                    cast_to=model_dtype,
+                    unlink_shm_after_read=self._unlink_mm_shm_after_read,
+                )
 
-            # EPD_PIXEL_SHM publishes the feature to scheduler SHM so the ZMQ hop
+            # The SHM path publishes the feature to scheduler SHM so the ZMQ hop
             # pickles ~KB instead of the full encoder tensor; the content hash is
             # taken on the real bytes first.
             feat_hash = None
@@ -173,7 +174,7 @@ class TokenSpeedEncoderServicer(tokenspeed_encoder_pb2_grpc.TokenSpeedEncoderSer
 
         bootstrap_room = request.items[0].bootstrap_room
 
-        if os.environ.get("EPD_INGEST_OFFLOOP", "1").lower() not in ("0", "false", "no"):
+        if self._ingest_offloop:
             # Per-item ingest (proto->tensor + pickle) BLOCKS the lone asyncio
             # event loop, so grpc.aio cannot deliver the next Encode message until
             # the previous one is fully ingested -- a per-worker serial encoder-input lane.
