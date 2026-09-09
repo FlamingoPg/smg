@@ -14,7 +14,7 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     policies::{CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerLeg},
     routers::{
-        common::placement::{self, PairCandidates, PairFailure, PlacementFailure, PlacementInputs},
+        common::placement::{self, PairFailure, PlacementFailure, PlacementInputs},
         error,
         grpc::{
             context::{
@@ -25,7 +25,7 @@ use crate::{
         },
     },
     worker::{
-        ConnectionModeExt, HashRing, ModelWorkerSnapshot, RoutingPool, RuntimeType, Worker,
+        ConnectionModeExt, HashRing, ModelWorkerSnapshot, PdWire, RoutingPool, RuntimeType, Worker,
         WorkerRegistry, WorkerType,
     },
 };
@@ -358,7 +358,9 @@ impl WorkerSelectionStage {
             };
             match verdict {
                 PlacementFailure::AllOverloaded(shed) => return shed,
-                PlacementFailure::Unavailable | PlacementFailure::PolicyDeclined(_) => {
+                PlacementFailure::Unavailable
+                | PlacementFailure::PolicyDeclined(_)
+                | PlacementFailure::NoCompatiblePair { .. } => {
                     unavailable = true;
                 }
                 PlacementFailure::NoCandidates => {}
@@ -403,6 +405,29 @@ impl WorkerSelectionStage {
             PlacementFailure::AllOverloaded(shed) => shed,
             PlacementFailure::Unavailable | PlacementFailure::PolicyDeclined(_) => {
                 self.workers_unavailable(model_id)
+            }
+            PlacementFailure::NoCompatiblePair {
+                prefill,
+                decode,
+                mismatches,
+            } => {
+                error!(
+                    function = "WorkerSelectionStage::execute",
+                    mode = ?self.mode,
+                    model_id = %model_id,
+                    ?mismatches,
+                    ?prefill,
+                    ?decode,
+                    "No prefill/decode pair shares a KV transfer protocol"
+                );
+                error::service_unavailable(
+                    "no_compatible_pd_pair",
+                    format!(
+                        "No prefill/decode pair for model '{model_id}' shares a KV transfer \
+                         protocol (mismatch on {mismatches:?}; prefill: {prefill:?}, decode: \
+                         {decode:?})"
+                    ),
+                )
             }
             PlacementFailure::NoCandidates => {
                 error!(
@@ -506,16 +531,12 @@ impl WorkerSelectionStage {
         // share a runtime, the rendezvous being runtime-specific, and a retry
         // pins both to the retained plan's runtime.
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
-        let prefill = snapshot.pool(RoutingPool::GrpcPrefill);
-        let decode = snapshot.pool(RoutingPool::GrpcDecode);
+        let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
         let pair = placement::select_pair(
             &self.worker_registry,
             &self.policy_registry,
             model_id,
-            PairCandidates {
-                prefill: &prefill,
-                decode: &decode,
-            },
+            &pairs,
             wire,
             true,
             PlacementInputs {

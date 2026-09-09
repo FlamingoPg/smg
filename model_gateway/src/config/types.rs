@@ -43,6 +43,10 @@ pub struct RouterConfig {
     /// Per-request sticky-session routing (rid-lineage keys, header fallback).
     #[serde(default, alias = "sticky_sessions")]
     pub routing_key_override: RoutingKeyOverrideConfig,
+    /// How strictly PD placement pairs a prefill with a decode on their KV
+    /// transfer protocol; see [`PdPairingMode`].
+    #[serde(default)]
+    pub pd_pairing_mode: PdPairingMode,
     pub host: String,
     pub port: u16,
     /// Dedicated port for the isolated Kubernetes liveness/readiness/health
@@ -524,6 +528,56 @@ pub enum ManualAssignmentMode {
     /// policy, then pin. With `--policy manual` (no underlying policy to
     /// delegate to) this falls back to min-load.
     Delegate,
+}
+
+/// How strictly PD placement pairs a prefill with a decode on their KV
+/// transfer protocol (#2483). A descriptor component an engine does not report
+/// is "unknown".
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PdPairingMode {
+    /// Pair on nothing: placement behaves as if no descriptor existed.
+    Off,
+    /// A known difference in runtime, transport or KV layout refuses the
+    /// pair; unknown components and engine versions pair with anything.
+    #[default]
+    Lenient,
+    /// Runtime, transport and KV layout must be known on both sides and
+    /// agree, and reported engine versions must match.
+    Strict,
+}
+
+impl PdPairingMode {
+    /// Number of modes, for per-mode caches.
+    pub const COUNT: usize = 3;
+
+    /// A dense index for per-mode caches.
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Off => 0,
+            Self::Lenient => 1,
+            Self::Strict => 2,
+        }
+    }
+
+    /// Parse the CLI spelling (`off` / `lenient` / `strict`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "lenient" => Some(Self::Lenient),
+            "strict" => Some(Self::Strict),
+            _ => None,
+        }
+    }
+
+    /// The CLI spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Lenient => "lenient",
+            Self::Strict => "strict",
+        }
+    }
 }
 
 /// Per-request sticky-routing override: when a sticky key is present, any
@@ -1063,6 +1117,7 @@ impl Default for RouterConfig {
             policy: PolicyConfig::Random,
             cache_boundaries: Vec::new(),
             routing_key_override: RoutingKeyOverrideConfig::default(),
+            pd_pairing_mode: PdPairingMode::default(),
             host: "0.0.0.0".to_string(),
             port: 3001,
             health_check_port: None,
