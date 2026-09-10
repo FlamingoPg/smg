@@ -15,6 +15,8 @@
 //!   each block starts with the maximal `COMPRESS_PAD_TO - 1` leading pads.
 //! - `model_specific["perm"]`   : per-item aligner row order, concatenated.
 //! - `model_specific["types_lengths"]` : per-item `types` lengths for slicing.
+//! - `model_specific["patch_counts"]` / `["perm_lengths"]` : per-item ViT
+//!   patch and aligner-row counts for slicing the concatenated tensors.
 //!
 //! The leading compress pads are position-dependent in the official flow
 //! (`3 - block_start % 4`); the replacement layer trims
@@ -163,9 +165,9 @@ fn safe_resize(
     max_n_token: usize,
 ) -> (usize, usize, usize, usize) {
     let cap = max_n_token.saturating_sub(COMPRESS_PAD_TO - 1);
-    let (_, _, mut num) = grid_tokens(best_h, best_w, p, r);
+    let (n_llm_h, n_llm_w, mut num) = grid_tokens(best_h, best_w, p, r);
     let mut budget = cap;
-    let mut geom = (0usize, 0usize, best_h, best_w);
+    let mut geom = (n_llm_h, n_llm_w, best_h, best_w);
     while num > cap {
         let (h, w, bh, bw, n) = solve_resize_ratio(height, width, p, r, budget);
         if n == usize::MAX || bh == 0 || bw == 0 {
@@ -449,6 +451,8 @@ impl VisionPreProcessor for DeepseekV4Processor {
         let mut types_flat: Vec<i64> = Vec::new();
         let mut perm_flat: Vec<i64> = Vec::new();
         let mut types_lengths: Vec<i64> = Vec::with_capacity(images.len());
+        let mut patch_counts: Vec<i64> = Vec::with_capacity(images.len());
+        let mut perm_lengths: Vec<i64> = Vec::with_capacity(images.len());
 
         for img in images {
             let plan = plan_image(img, &params)?;
@@ -459,12 +463,14 @@ impl VisionPreProcessor for DeepseekV4Processor {
             n_vit_h_vec.push(plan.n_vit_h as i64);
             n_vit_w_vec.push(plan.n_vit_w as i64);
             types_lengths.push(types.len() as i64);
+            patch_counts.push((plan.n_vit_h * plan.n_vit_w) as i64);
+            perm_lengths.push(perm.len() as i64);
             types_flat.extend(types);
             perm_flat.extend(perm);
         }
 
         let shape = vec![
-            feature_token_counts.iter().sum::<usize>(),
+            patch_counts.iter().sum::<i64>() as usize,
             3,
             params.patch,
             params.patch,
@@ -493,24 +499,18 @@ impl VisionPreProcessor for DeepseekV4Processor {
                         shape: vec![perm_len],
                     },
                 )
-                .with_extra("types_lengths", ModelSpecificValue::IntVec(types_lengths)),
+                .with_extra("types_lengths", ModelSpecificValue::IntVec(types_lengths))
+                .with_extra("patch_counts", ModelSpecificValue::IntVec(patch_counts))
+                .with_extra("perm_lengths", ModelSpecificValue::IntVec(perm_lengths)),
         )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::io::Cursor;
 
-    fn params() -> Params {
-        Params {
-            patch: 14,
-            downsample: 3,
-            max_n_token: 384,
-            min_pixels: 147_456,
-            max_wh_ratio: Some(8),
-        }
-    }
+    use super::*;
 
     /// Mirrors the official Python expected outputs (computed once against
     /// inference/image_processor.py and pinned here).
@@ -590,12 +590,78 @@ mod tests {
     #[test]
     fn safe_resize_fits_budget() {
         // A huge square image must come back within the 384-token budget.
-        let (n_llm_h, n_llm_w, bh, bw) = safe_resize(4096, 4096, 4096, 4096, 14, 3, 384);
+        let (n_llm_h, _, bh, bw) = safe_resize(4096, 4096, 4096, 4096, 14, 3, 384);
         let (_, _, num) = grid_tokens(bh, bw, 14, 3);
         assert!(num <= 384 - 3, "num tokens {num} exceeds budget");
         assert!(n_llm_h % 2 == 0);
         assert_eq!(bh % 14, 0);
         assert_eq!(bw % 14, 0);
+    }
+
+    #[test]
+    fn safe_resize_preserves_grid_within_budget() {
+        assert_eq!(safe_resize(84, 84, 84, 84, 14, 3, 384), (2, 2, 84, 84));
+    }
+
+    #[test]
+    fn preprocess_png_batch_preserves_patch_and_aligner_counts() {
+        let mut images = Vec::new();
+        for (width, height, color) in [(84, 84, [0, 127, 255]), (126, 42, [255, 0, 127])] {
+            let original = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                width,
+                height,
+                image::Rgb(color),
+            ));
+            let mut png = Cursor::new(Vec::new());
+            original
+                .write_to(&mut png, image::ImageFormat::Png)
+                .unwrap();
+            images.push(image::load_from_memory(png.get_ref()).unwrap());
+        }
+        let config: PreProcessorConfig = serde_json::from_value(serde_json::json!({
+            "vision_min_pixels": 0
+        }))
+        .unwrap();
+        let output = DeepseekV4Processor.preprocess(&images, &config).unwrap();
+        assert_eq!(output.encoder_input.shape(), &[63, 3, 14, 14]);
+        assert_eq!(output.feature_token_counts, vec![4, 3]);
+        for (key, expected) in [
+            ("n_vit_h", vec![6, 3]),
+            ("n_vit_w", vec![6, 9]),
+            ("patch_counts", vec![36, 27]),
+            ("perm_lengths", vec![4, 3]),
+            ("types_lengths", vec![13, 13]),
+        ] {
+            assert!(
+                matches!(
+                    output.model_specific.get(key),
+                    Some(ModelSpecificValue::IntVec(actual)) if *actual == expected
+                ),
+                "{key}"
+            );
+        }
+        let ModelSpecificValue::IntTensor { data: types, .. } = &output.model_specific["types"]
+        else {
+            panic!("missing types");
+        };
+        let ModelSpecificValue::IntTensor { data: perm, .. } = &output.model_specific["perm"]
+        else {
+            panic!("missing perm");
+        };
+        assert_eq!(types.iter().filter(|&&t| t == IMAGE).count(), 7);
+        assert_eq!(perm, &[0, 2, 1, 3, 0, 1, 2]);
+        // Patch boundaries must preserve each decoded image's normalized color.
+        assert_eq!(output.encoder_input[[0, 0, 0, 0]], -1.0);
+        assert_eq!(output.encoder_input[[35, 2, 13, 13]], 1.0);
+        assert_eq!(output.encoder_input[[36, 0, 0, 0]], 1.0);
+        assert_eq!(output.encoder_input[[62, 1, 13, 13]], -1.0);
+
+        // The checkpoint defaults exercise the minimum-pixel upscaling path.
+        let default_output = DeepseekV4Processor
+            .preprocess(&images[..1], &PreProcessorConfig::default())
+            .unwrap();
+        assert_eq!(default_output.encoder_input.shape(), &[784, 3, 14, 14]);
+        assert_eq!(default_output.feature_token_counts, vec![100]);
     }
 
     #[test]

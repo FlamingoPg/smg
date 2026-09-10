@@ -1,11 +1,12 @@
 //! DeepSeek V4 Flash Vision registry spec: model detection, placeholder
-//! handling, and the extra-vocab sentinel expansion consumed by the engine.
+//! handling, and the image-block expansion consumed by the engine.
 //!
 //! The checkpoint keeps `architectures: ["DeepseekV4ForCausalLM"]` and is a
 //! vision model iff `vision_n_layers > 0` in its config. Image placeholders
 //! (`<｜deepseek_image｜>`) expand into the official N-layout sentinel block:
-//! every token is `vocab_size + sentinel_type` (the extra-vocab id range the
-//! engine's MoE `bias_vl` and prefill SWA recognize).
+//! every position uses the tokenizer-resolved `<｜deepseek_image｜>` id.
+//! Sentinel types travel separately; the engine fills the whole block with
+//! vision vectors and includes the whole block in image-aware prefix hashing.
 //!
 //! Each block starts with the maximal `COMPRESS_PAD_TO - 1` leading pads so
 //! the replacement layer can trim `block_start % 4` of them at splice time
@@ -33,56 +34,6 @@ pub const IMAGE_PLACEHOLDER: &str = "<｜deepseek_image｜>";
 const MAX_IMAGES: usize = 16;
 
 pub(super) struct DeepseekV4Spec;
-
-impl DeepseekV4Spec {
-    /// `vocab_size` from the model config — the base of the extra-vocab
-    /// sentinel id range. Must match the serving engine's tokenizer.
-    fn vocab_size(metadata: &ModelMetadata) -> RegistryResult<TokenId> {
-        metadata
-            .config_u32(&["vocab_size"])
-            .map(|v| v as TokenId)
-            .ok_or_else(|| ModelRegistryError::MissingConfigField {
-                field: "vocab_size".to_string(),
-            })
-    }
-
-    /// Per-item sentinel `types` slices from the batched preprocessed output.
-    fn item_types(preprocessed: &PreprocessedEncoderInputs) -> RegistryResult<Vec<Vec<i64>>> {
-        let lengths = match preprocessed.model_specific.get("types_lengths") {
-            Some(ModelSpecificValue::IntVec(v)) => v.clone(),
-            _ => {
-                return Err(ModelRegistryError::UnsupportedModel(
-                    "deepseek_v4 preprocessed output missing types_lengths".to_string(),
-                ))
-            }
-        };
-        let flat = match preprocessed.model_specific.get("types") {
-            Some(ModelSpecificValue::IntTensor { data, .. }) => data.clone(),
-            _ => {
-                return Err(ModelRegistryError::UnsupportedModel(
-                    "deepseek_v4 preprocessed output missing types".to_string(),
-                ))
-            }
-        };
-        let mut out = Vec::with_capacity(lengths.len());
-        let mut offset = 0usize;
-        for len in lengths {
-            let len = usize::try_from(len).map_err(|_| {
-                ModelRegistryError::UnsupportedModel(
-                    "deepseek_v4 preprocessed output missing types_lengths".to_string(),
-                )
-            })?;
-            if offset + len > flat.len() {
-                return Err(ModelRegistryError::UnsupportedModel(
-                    "deepseek_v4 preprocessed output missing types".to_string(),
-                ));
-            }
-            out.push(flat[offset..offset + len].to_vec());
-            offset += len;
-        }
-        Ok(out)
-    }
-}
 
 impl ModelProcessorSpec for DeepseekV4Spec {
     fn name(&self) -> &'static str {
@@ -140,41 +91,87 @@ impl ModelProcessorSpec for DeepseekV4Spec {
         Ok(json!({ "extra": extra }))
     }
 
-    /// One replacement per image: the full sentinel block as extra-vocab ids.
+    /// One replacement per image: the full block of image placeholder ids.
     /// The head carries `COMPRESS_PAD_TO - 1` pads for position trimming.
     fn prompt_replacements(
         &self,
         metadata: &ModelMetadata,
         preprocessed: &PreprocessedEncoderInputs,
     ) -> RegistryResult<Vec<PromptReplacement>> {
-        let vocab = Self::vocab_size(metadata)?;
-        let item_types = Self::item_types(preprocessed)?;
-        Ok(item_types
-            .into_iter()
-            .map(|types| {
-                let tokens: Vec<TokenId> = types.iter().map(|&t| vocab + t as TokenId).collect();
-                PromptReplacement::sequence(Modality::Image, IMAGE_PLACEHOLDER, tokens)
+        let image_token_id = self.placeholder_token_id(metadata)?;
+        let lengths = match preprocessed.model_specific.get("types_lengths") {
+            Some(ModelSpecificValue::IntVec(lengths)) => lengths,
+            _ => {
+                return Err(ModelRegistryError::InvalidPreprocessedField {
+                    field: "types_lengths".to_string(),
+                })
+            }
+        };
+        let mut remaining = match preprocessed.model_specific.get("types") {
+            Some(ModelSpecificValue::IntTensor { data, .. }) => data.len(),
+            _ => {
+                return Err(ModelRegistryError::InvalidPreprocessedField {
+                    field: "types".to_string(),
+                })
+            }
+        };
+        lengths
+            .iter()
+            .map(|&len| {
+                let len = usize::try_from(len).map_err(|_| {
+                    ModelRegistryError::InvalidPreprocessedField {
+                        field: "types_lengths".to_string(),
+                    }
+                })?;
+                remaining = remaining.checked_sub(len).ok_or_else(|| {
+                    ModelRegistryError::InvalidPreprocessedField {
+                        field: "types_lengths".to_string(),
+                    }
+                })?;
+                Ok(PromptReplacement::sequence(
+                    Modality::Image,
+                    IMAGE_PLACEHOLDER,
+                    vec![image_token_id; len],
+                ))
             })
-            .collect())
+            .collect()
     }
 
-    /// Sentinel blocks must start at a token index divisible by 4 (the
-    /// aligner's compression alignment). The replacement layer trims
+    /// IMAGE data must start at a token index divisible by 4 (the aligner's
+    /// compression alignment). The replacement layer trims
     /// `block_start % 4` leading pads from each expansion.
     fn replacement_alignment(&self) -> Option<u32> {
         Some(COMPRESS_PAD_TO as u32)
     }
 
-    /// Patches are already per-item slices of the primary encoder input;
-    /// side tensors are batched (per-item value lists).
+    /// Patches, types and permutations are concatenated across images;
+    /// geometry and lengths are one scalar per image. Types retain all three
+    /// leading pads on the wire; the receiver trims by the prompt offset.
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
         HashMap::from([
-            ("pixel_values".to_string(), FieldLayout::Batched),
-            ("types".to_string(), FieldLayout::Batched),
-            ("perm".to_string(), FieldLayout::Batched),
+            (
+                "pixel_values".to_string(),
+                FieldLayout::Flat {
+                    sizes_key: "patch_counts".to_string(),
+                },
+            ),
+            (
+                "types".to_string(),
+                FieldLayout::Flat {
+                    sizes_key: "types_lengths".to_string(),
+                },
+            ),
+            (
+                "perm".to_string(),
+                FieldLayout::Flat {
+                    sizes_key: "perm_lengths".to_string(),
+                },
+            ),
             ("n_vit_h".to_string(), FieldLayout::Batched),
             ("n_vit_w".to_string(), FieldLayout::Batched),
             ("types_lengths".to_string(), FieldLayout::Batched),
+            ("patch_counts".to_string(), FieldLayout::Batched),
+            ("perm_lengths".to_string(), FieldLayout::Batched),
         ])
     }
 
@@ -187,6 +184,8 @@ impl ModelProcessorSpec for DeepseekV4Spec {
             "n_vit_h".to_string(),
             "n_vit_w".to_string(),
             "types_lengths".to_string(),
+            "patch_counts".to_string(),
+            "perm_lengths".to_string(),
         ]
     }
 }
@@ -194,9 +193,70 @@ impl ModelProcessorSpec for DeepseekV4Spec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vision::processors::deepseek_v4::{
-        IMAGE, IMAGE_END, IMAGE_NEW_LINE, IMAGE_PAD, IMAGE_START,
+    use crate::{
+        registry::test_helpers::TestTokenizer,
+        vision::{
+            processors::deepseek_v4::{
+                DeepseekV4Processor, IMAGE, IMAGE_END, IMAGE_NEW_LINE, IMAGE_PAD, IMAGE_START,
+            },
+            PreProcessorConfig, VisionPreProcessor,
+        },
     };
+
+    #[test]
+    fn replacements_repeat_tokenizer_image_id_for_the_entire_block() {
+        let images = [
+            image::DynamicImage::new_rgb8(84, 84),
+            image::DynamicImage::new_rgb8(126, 42),
+        ];
+        let processor_config: PreProcessorConfig = serde_json::from_value(json!({
+            "vision_min_pixels": 0
+        }))
+        .unwrap();
+        let preprocessed = DeepseekV4Processor
+            .preprocess(&images, &processor_config)
+            .unwrap();
+        // No vocab_size is needed, and a custom tokenizer must not be ignored.
+        for token_id in [129264, 4242] {
+            let tokenizer = TestTokenizer::new(&[(IMAGE_PLACEHOLDER, token_id)]);
+            let config = json!({"model_type": "deepseek_v4", "vision_n_layers": 1});
+            let metadata = ModelMetadata {
+                model_id: "deepseek-v4-vision",
+                tokenizer: &tokenizer,
+                config: &config,
+            };
+            let replacements = DeepseekV4Spec
+                .prompt_replacements(&metadata, &preprocessed)
+                .unwrap();
+            assert_eq!(replacements.len(), 2);
+            for replacement in replacements {
+                assert_eq!(replacement.tokens, vec![token_id as TokenId; 13]);
+                assert!(replacement.feature_ranges.is_none());
+            }
+            for lengths in [vec![-1], vec![i64::MAX], vec![13, 14]] {
+                let mut invalid = preprocessed.clone();
+                invalid.model_specific.insert(
+                    "types_lengths".to_string(),
+                    ModelSpecificValue::IntVec(lengths),
+                );
+                assert!(matches!(
+                    DeepseekV4Spec.prompt_replacements(&metadata, &invalid),
+                    Err(ModelRegistryError::InvalidPreprocessedField { .. })
+                ));
+            }
+        }
+        let tokenizer = TestTokenizer::new(&[]);
+        let config = json!({"vocab_size": 129280});
+        let metadata = ModelMetadata {
+            model_id: "deepseek-v4-vision",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        assert!(matches!(
+            DeepseekV4Spec.prompt_replacements(&metadata, &preprocessed),
+            Err(ModelRegistryError::TokenNotFound { .. })
+        ));
+    }
     #[test]
     fn sentinel_constants_match_official() {
         assert_eq!(IMAGE_START, 0);
