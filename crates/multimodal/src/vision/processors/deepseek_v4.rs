@@ -15,6 +15,8 @@
 //!   each block starts with the maximal `COMPRESS_PAD_TO - 1` leading pads.
 //! - `model_specific["perm"]`   : per-item aligner row order, concatenated.
 //! - `model_specific["types_lengths"]` : per-item `types` lengths for slicing.
+//! - `model_specific["patch_counts"]` / `["perm_lengths"]` : per-item ViT
+//!   patch and aligner-row counts for slicing the concatenated tensors.
 //!
 //! The leading compress pads are position-dependent in the official flow
 //! (`3 - block_start % 4`); the replacement layer trims
@@ -58,6 +60,8 @@ struct Params {
     max_wh_ratio: Option<usize>,
 }
 
+/// Read a `usize` extra key strictly: absent falls back to `default`, a
+/// present-but-unusable value is a config error (mirrors the GLM helper).
 fn extra_usize(
     config: &PreProcessorConfig,
     key: &str,
@@ -163,16 +167,18 @@ fn safe_resize(
     max_n_token: usize,
 ) -> (usize, usize, usize, usize) {
     let cap = max_n_token.saturating_sub(COMPRESS_PAD_TO - 1);
-    let (_, _, mut num) = grid_tokens(best_h, best_w, p, r);
+    let (n_llm_h, n_llm_w, mut num) = grid_tokens(best_h, best_w, p, r);
     let mut budget = cap;
-    let mut geom = (0usize, 0usize, best_h, best_w);
+    let mut geom = (n_llm_h, n_llm_w, best_h, best_w);
     while num > cap {
         let (h, w, bh, bw, n) = solve_resize_ratio(height, width, p, r, budget);
         if n == usize::MAX || bh == 0 || bw == 0 {
             // Degenerate solve (budget collapsed below the smallest legal
             // grid): retry once at the floor budget so the loop terminates.
             let (h, w, bh, bw, _) = solve_resize_ratio(height, width, p, r, COMPRESS_PAD_TO + 4);
-            return (h, w, bh, bw);
+            // Clamp to at least one patch of geometry so downstream
+            // planners never see a zero-sized canvas.
+            return (h.max(1), w.max(1), bh.max(p), bw.max(p));
         }
         geom = (h, w, bh, bw);
         num = n;
@@ -193,6 +199,8 @@ struct PlannedImage {
     n_llm_w: usize,
 }
 
+/// Plan one image: solve the official geometry, then produce the resized or
+/// letterboxed RGB canvas the patch extractor reads.
 fn plan_image(img: &DynamicImage, params: &Params) -> Result<PlannedImage, TransformError> {
     let (iw, ih) = img.dimensions();
     let (iw, ih) = (iw as usize, ih as usize);
@@ -202,37 +210,7 @@ fn plan_image(img: &DynamicImage, params: &Params) -> Result<PlannedImage, Trans
         ));
     }
     let p = params.patch;
-
-    // Constrain the aspect ratio first (width clamp), then enforce the
-    // minimum-pixel floor — same order as the official loader.
-    let mut width = iw;
-    let mut height = ih;
-    if let Some(ratio) = params.max_wh_ratio {
-        if width > height * ratio {
-            width = height * ratio;
-        }
-    }
-    if width * height < params.min_pixels {
-        let scale = (params.min_pixels as f64 / (width * height) as f64).sqrt();
-        width = (width as f64 * scale) as usize;
-        height = (height as f64 * scale) as usize;
-        width = width.max(1);
-        height = height.max(1);
-    }
-
-    let mut best_w = width.div_ceil(p) * p;
-    let mut best_h = height.div_ceil(p) * p;
-    let (n_llm_h, n_llm_w, rh, rw) = safe_resize(
-        height,
-        width,
-        best_h,
-        best_w,
-        p,
-        params.downsample,
-        params.max_n_token,
-    );
-    best_h = rh;
-    best_w = rw;
+    let (n_llm_h, n_llm_w, best_h, best_w) = solve_geometry(iw, ih, params);
     let n_vit_h = best_h / p;
     let n_vit_w = best_w / p;
 
@@ -254,6 +232,37 @@ fn plan_image(img: &DynamicImage, params: &Params) -> Result<PlannedImage, Trans
         n_llm_h,
         n_llm_w,
     })
+}
+
+/// The full official geometry solve for one image: aspect-ratio clamp,
+/// minimum-pixel floor, patch-size ceiling, and the safe-resize budget loop.
+/// Shared by `plan_image` and `calculate_num_tokens` so both agree on the
+/// final grid. Returns `(n_llm_h, n_llm_w, best_h, best_w)`.
+fn solve_geometry(iw: usize, ih: usize, params: &Params) -> (usize, usize, usize, usize) {
+    let p = params.patch;
+    let mut width = iw;
+    let mut height = ih;
+    if let Some(ratio) = params.max_wh_ratio {
+        if width > height * ratio {
+            width = height * ratio;
+        }
+    }
+    if width * height < params.min_pixels {
+        let scale = (params.min_pixels as f64 / (width * height) as f64).sqrt();
+        width = ((width as f64 * scale) as usize).max(1);
+        height = ((height as f64 * scale) as usize).max(1);
+    }
+    let best_w = width.div_ceil(p) * p;
+    let best_h = height.div_ceil(p) * p;
+    safe_resize(
+        height,
+        width,
+        best_h,
+        best_w,
+        p,
+        params.downsample,
+        params.max_n_token,
+    )
 }
 
 /// Bilinear-free nearest resize is NOT what PIL uses; the official path uses
@@ -292,15 +301,19 @@ fn resize_hwc(src: &image::RgbImage, sw: usize, sh: usize, tw: usize, th: usize)
 }
 
 /// Contain-scale `src` into `tw x th` and letterbox the remainder with
-/// `fill` on the right/bottom — `ImageOps.pad` semantics.
+/// `fill`, centering the image like PIL's `ImageOps.pad` (default
+/// `centering=(0.5, 0.5)`).
 fn pad_hwc(src: &image::RgbImage, sw: usize, sh: usize, tw: usize, th: usize, fill: u8) -> Vec<u8> {
     let scale = (tw as f64 / sw as f64).min(th as f64 / sh as f64);
     let nw = ((sw as f64 * scale).round() as usize).clamp(1, tw);
     let nh = ((sh as f64 * scale).round() as usize).clamp(1, th);
     let inner = resize_hwc(src, sw, sh, nw, nh);
     let mut out = vec![fill; tw * th * 3];
+    let x_off = (tw - nw) / 2;
+    let y_off = (th - nh) / 2;
     for y in 0..nh {
-        let dst = (y * tw * 3)..(y * tw * 3 + nw * 3);
+        let row = (y_off + y) * tw + x_off;
+        let dst = (row * 3)..(row * 3 + nw * 3);
         let src_range = (y * nw * 3)..((y + 1) * nw * 3);
         out[dst].copy_from_slice(&inner[src_range]);
     }
@@ -416,17 +429,13 @@ impl VisionPreProcessor for DeepseekV4Processor {
             Ok(p) => p,
             Err(_) => return 0,
         };
-        let mut w = width as usize;
-        let h = height as usize;
-        if let Some(ratio) = params.max_wh_ratio {
-            if w > h * ratio {
-                w = h * ratio;
-            }
+        if width == 0 || height == 0 {
+            return 0;
         }
-        let bw = w.div_ceil(params.patch) * params.patch;
-        let bh = h.div_ceil(params.patch) * params.patch;
-        let (_, _, num) = grid_tokens(bh, bw, params.patch, params.downsample);
-        num.min(params.max_n_token)
+        // Same solve as `preprocess` so the estimate matches the final
+        // feature-token count (the IMAGE slots of the aligner grid).
+        let (n_llm_h, n_llm_w, ..) = solve_geometry(width as usize, height as usize, &params);
+        n_llm_h * n_llm_w
     }
 
     fn preprocess(
@@ -449,6 +458,8 @@ impl VisionPreProcessor for DeepseekV4Processor {
         let mut types_flat: Vec<i64> = Vec::new();
         let mut perm_flat: Vec<i64> = Vec::new();
         let mut types_lengths: Vec<i64> = Vec::with_capacity(images.len());
+        let mut patch_counts: Vec<i64> = Vec::with_capacity(images.len());
+        let mut perm_lengths: Vec<i64> = Vec::with_capacity(images.len());
 
         for img in images {
             let plan = plan_image(img, &params)?;
@@ -459,12 +470,14 @@ impl VisionPreProcessor for DeepseekV4Processor {
             n_vit_h_vec.push(plan.n_vit_h as i64);
             n_vit_w_vec.push(plan.n_vit_w as i64);
             types_lengths.push(types.len() as i64);
+            patch_counts.push((plan.n_vit_h * plan.n_vit_w) as i64);
+            perm_lengths.push(perm.len() as i64);
             types_flat.extend(types);
             perm_flat.extend(perm);
         }
 
         let shape = vec![
-            feature_token_counts.iter().sum::<usize>(),
+            patch_counts.iter().sum::<i64>() as usize,
             3,
             params.patch,
             params.patch,
@@ -493,24 +506,18 @@ impl VisionPreProcessor for DeepseekV4Processor {
                         shape: vec![perm_len],
                     },
                 )
-                .with_extra("types_lengths", ModelSpecificValue::IntVec(types_lengths)),
+                .with_extra("types_lengths", ModelSpecificValue::IntVec(types_lengths))
+                .with_extra("patch_counts", ModelSpecificValue::IntVec(patch_counts))
+                .with_extra("perm_lengths", ModelSpecificValue::IntVec(perm_lengths)),
         )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::io::Cursor;
 
-    fn params() -> Params {
-        Params {
-            patch: 14,
-            downsample: 3,
-            max_n_token: 384,
-            min_pixels: 147_456,
-            max_wh_ratio: Some(8),
-        }
-    }
+    use super::*;
 
     /// Mirrors the official Python expected outputs (computed once against
     /// inference/image_processor.py and pinned here).
@@ -590,12 +597,108 @@ mod tests {
     #[test]
     fn safe_resize_fits_budget() {
         // A huge square image must come back within the 384-token budget.
-        let (n_llm_h, n_llm_w, bh, bw) = safe_resize(4096, 4096, 4096, 4096, 14, 3, 384);
+        let (n_llm_h, _, bh, bw) = safe_resize(4096, 4096, 4096, 4096, 14, 3, 384);
         let (_, _, num) = grid_tokens(bh, bw, 14, 3);
         assert!(num <= 384 - 3, "num tokens {num} exceeds budget");
         assert!(n_llm_h % 2 == 0);
         assert_eq!(bh % 14, 0);
         assert_eq!(bw % 14, 0);
+    }
+
+    #[test]
+    fn safe_resize_preserves_grid_within_budget() {
+        assert_eq!(safe_resize(84, 84, 84, 84, 14, 3, 384), (2, 2, 84, 84));
+    }
+
+    #[test]
+    fn calculate_num_tokens_matches_preprocess_feature_counts() {
+        let config = serde_json::from_str::<crate::vision::preprocessor_config::PreProcessorConfig>(
+            r#"{"extra": {"vision_patch_size": 14, "vision_downsample_ratio": 3,
+                          "vision_max_n_token": 384, "vision_min_pixels": 147456,
+                          "vision_max_wh_ratio": 8}}"#,
+        )
+        .unwrap();
+        let processor = DeepseekV4Processor;
+        for (w, h) in [(84u32, 84u32), (512, 256), (4000, 4000), (200, 2000)] {
+            let estimated = processor.calculate_num_tokens(w, h, &config);
+            let img = DynamicImage::ImageRgb8(image::RgbImage::new(w, h));
+            let preprocessed = processor.preprocess(&[img], &config).unwrap();
+            let actual: usize = preprocessed.feature_token_counts.iter().sum();
+            assert_eq!(estimated, actual, "estimate mismatch for {w}x{h}");
+        }
+    }
+
+    #[test]
+    fn pad_hwc_centers_content() {
+        // A 2x1 white image contained into 4x4 must sit centered: rows 1-2
+        // hold the content, rows 0 and 3 hold the fill.
+        let src = image::RgbImage::from_pixel(2, 1, image::Rgb([255, 255, 255]));
+        let out = pad_hwc(&src, 2, 1, 4, 4, 127);
+        let row = |y: usize| out[(y * 4 * 3)..(y * 4 * 3 + 4 * 3)].to_vec();
+        assert!(row(0).iter().all(|&b| b == 127), "top row must be fill");
+        assert!(row(3).iter().all(|&b| b == 127), "bottom row must be fill");
+        assert!(row(1).windows(3).step_by(3).any(|w| w == [255, 255, 255]));
+    }
+
+    #[test]
+    fn preprocess_png_batch_preserves_patch_and_aligner_counts() {
+        let mut images = Vec::new();
+        for (width, height, color) in [(84, 84, [0, 127, 255]), (126, 42, [255, 0, 127])] {
+            let original = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                width,
+                height,
+                image::Rgb(color),
+            ));
+            let mut png = Cursor::new(Vec::new());
+            original
+                .write_to(&mut png, image::ImageFormat::Png)
+                .unwrap();
+            images.push(image::load_from_memory(png.get_ref()).unwrap());
+        }
+        let config: PreProcessorConfig = serde_json::from_value(serde_json::json!({
+            "vision_min_pixels": 0
+        }))
+        .unwrap();
+        let output = DeepseekV4Processor.preprocess(&images, &config).unwrap();
+        assert_eq!(output.encoder_input.shape(), &[63, 3, 14, 14]);
+        assert_eq!(output.feature_token_counts, vec![4, 3]);
+        for (key, expected) in [
+            ("n_vit_h", vec![6, 3]),
+            ("n_vit_w", vec![6, 9]),
+            ("patch_counts", vec![36, 27]),
+            ("perm_lengths", vec![4, 3]),
+            ("types_lengths", vec![13, 13]),
+        ] {
+            assert!(
+                matches!(
+                    output.model_specific.get(key),
+                    Some(ModelSpecificValue::IntVec(actual)) if *actual == expected
+                ),
+                "{key}"
+            );
+        }
+        let ModelSpecificValue::IntTensor { data: types, .. } = &output.model_specific["types"]
+        else {
+            panic!("missing types");
+        };
+        let ModelSpecificValue::IntTensor { data: perm, .. } = &output.model_specific["perm"]
+        else {
+            panic!("missing perm");
+        };
+        assert_eq!(types.iter().filter(|&&t| t == IMAGE).count(), 7);
+        assert_eq!(perm, &[0, 2, 1, 3, 0, 1, 2]);
+        // Patch boundaries must preserve each decoded image's normalized color.
+        assert_eq!(output.encoder_input[[0, 0, 0, 0]], -1.0);
+        assert_eq!(output.encoder_input[[35, 2, 13, 13]], 1.0);
+        assert_eq!(output.encoder_input[[36, 0, 0, 0]], 1.0);
+        assert_eq!(output.encoder_input[[62, 1, 13, 13]], -1.0);
+
+        // The checkpoint defaults exercise the minimum-pixel upscaling path.
+        let default_output = DeepseekV4Processor
+            .preprocess(&images[..1], &PreProcessorConfig::default())
+            .unwrap();
+        assert_eq!(default_output.encoder_input.shape(), &[784, 3, 14, 14]);
+        assert_eq!(default_output.feature_token_counts, vec![100]);
     }
 
     #[test]
