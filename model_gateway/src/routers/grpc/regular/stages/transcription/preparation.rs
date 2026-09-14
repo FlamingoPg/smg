@@ -114,6 +114,7 @@ fn build_chat_request(
             messages.push(ChatMessage::System {
                 content: MessageContent::Text(prompt.to_string()),
                 name: None,
+                ext: Default::default(),
             });
         }
     }
@@ -126,6 +127,7 @@ fn build_chat_request(
             },
         }]),
         name: None,
+        ext: Default::default(),
     });
 
     let prefill = family
@@ -144,6 +146,7 @@ fn build_chat_request(
             name: None,
             tool_calls: None,
             reasoning_content: None,
+            ext: Default::default(),
         });
     }
 
